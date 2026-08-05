@@ -27,15 +27,51 @@ fn hide_overlay(app: tauri::AppHandle) {
     }
 }
 
+/// Process names for the native "how do you want to open this file?"
+/// picker. While one of these owns the foreground window we keep waiting,
+/// no matter how long the user takes to decide — there's no fixed delay
+/// that's correct for both "opens instantly" and "user is reading the
+/// picker for 10 seconds".
+const PICKER_PROCESS_NAMES: &[&str] = &["openwith.exe", "applicationframehost.exe"];
+
+fn foreground_process_name() -> Option<String> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 260];
+        let mut len = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        result.ok()?;
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit(['\\', '/']).next().map(|s| s.to_lowercase())
+    }
+}
+
 /// Runs an external action (open/reveal) that spawns another top-level
 /// window (an editor, or Windows' own "How do you want to open this file?"
 /// picker for unassociated extensions). That window needs real focus, which
 /// our always-on-top overlay can get in the way of — so we drop topmost and
-/// suppress the usual hide-on-blur first. A short time later we check who
-/// ended up with focus: if it bounced back to us (the user cancelled the
-/// other window), the overlay just stays open as-is; if focus is elsewhere
-/// (the file opened for real), we hide it, matching the normal blur-hide
-/// behavior it would have gotten anyway.
+/// suppress the usual hide-on-blur first, then poll: as long as the picker
+/// specifically owns the foreground, keep waiting; the moment anything else
+/// does (a real app, or nothing), decide — hide if it's not us, leave the
+/// overlay alone if focus actually bounced back to it (user cancelled).
 fn launch_external(app: &tauri::AppHandle, run: impl FnOnce() + Send + 'static) {
     let Some(window) = app.get_webview_window("overlay") else {
         run();
@@ -51,19 +87,40 @@ fn launch_external(app: &tauri::AppHandle, run: impl FnOnce() + Send + 'static) 
 
     let app = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(900));
+        use std::time::{Duration, Instant};
+
+        // Give the external process a moment to actually spawn a window
+        // before we start trusting focus readings at all.
+        std::thread::sleep(Duration::from_millis(250));
+
         let Some(window) = app.get_webview_window("overlay") else {
             return;
         };
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        let resolved_hidden = loop {
+            if window.is_focused().unwrap_or(false) {
+                break false; // user is back on Lumos — nothing to hide
+            }
+            match foreground_process_name() {
+                Some(name) if PICKER_PROCESS_NAMES.contains(&name.as_str()) => {
+                    // picker's still up — keep waiting regardless of elapsed time
+                }
+                _ => break true, // some real app (or nothing) took over — done deciding
+            }
+            if Instant::now() >= deadline {
+                break true; // safety net so a stuck state can't poll forever
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        };
+
         if let Some(suppress) = app.try_state::<SuppressBlurHide>() {
             suppress.0.store(false, Ordering::SeqCst);
         }
-        if window.is_focused().unwrap_or(false) {
-            let _ = window.set_always_on_top(true);
-        } else {
+        if resolved_hidden {
             let _ = window.hide();
-            let _ = window.set_always_on_top(true);
         }
+        let _ = window.set_always_on_top(true);
     });
 }
 
