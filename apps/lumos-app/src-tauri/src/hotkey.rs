@@ -14,15 +14,18 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ActivateKeyboardLayout, GetKeyboardLayout, GetKeyboardLayoutList,
-    ACTIVATE_KEYBOARD_LAYOUT_FLAGS, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RCONTROL,
-    VK_RMENU, VK_RSHIFT, VK_SHIFT,
+    GetKeyboardLayout, GetKeyboardLayoutList, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
+    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    PostMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
+
+/// Not exposed as a named constant in the `windows` crate's WindowsAndMessaging
+/// module; value is stable/documented (winuser.h) since Windows NT.
+const WM_INPUTLANGCHANGEREQUEST: u32 = 0x0050;
 
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 
@@ -90,8 +93,13 @@ fn foreground_window_is_ours() -> bool {
     }
 }
 
-/// Cycles to the next installed keyboard layout on the foreground window's
-/// thread — the same effect as Windows' own Alt+Shift handling.
+/// Cycles to the next installed keyboard layout — but on the *target
+/// window's own thread*, not ours. `ActivateKeyboardLayout` only ever
+/// affects the calling thread, so calling it from our hook thread silently
+/// changes nothing the user can see (this was the "blinks in the taskbar
+/// but doesn't actually switch" bug). Posting WM_INPUTLANGCHANGEREQUEST is
+/// what Windows' own Alt+Shift handling does internally — the target
+/// window's message loop picks it up and switches itself.
 fn switch_to_next_layout() {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -114,7 +122,8 @@ fn switch_to_next_layout() {
 
         let idx = layouts.iter().position(|&l| l == current).unwrap_or(0);
         let next = layouts[(idx + 1) % layouts.len()];
-        let _ = ActivateKeyboardLayout(next, ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0));
+
+        let _ = PostMessageW(hwnd, WM_INPUTLANGCHANGEREQUEST, WPARAM(0), LPARAM(next.0 as isize));
     }
 }
 
