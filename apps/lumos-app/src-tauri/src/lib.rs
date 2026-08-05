@@ -147,6 +147,68 @@ fn reveal_in_explorer(app: tauri::AppHandle, path: String) -> Result<(), String>
     Ok(())
 }
 
+/// Opens the native folder picker. Unlike `launch_external`, we directly
+/// await this dialog's own completion — no need to poll for focus, we just
+/// bracket the call: drop always-on-top and suppress blur-hide so the
+/// dialog can focus properly, then restore both the moment it resolves
+/// (picked or cancelled) and hand focus straight back to the search input.
+#[tauri::command]
+async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    if let Some(s) = app.try_state::<SuppressBlurHide>() {
+        s.0.store(true, Ordering::SeqCst);
+    }
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.set_always_on_top(false);
+    }
+
+    let picked = rfd::AsyncFileDialog::new()
+        .set_title("Choose a project folder")
+        .pick_folder()
+        .await;
+
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.set_always_on_top(true);
+        let _ = w.set_focus();
+    }
+    if let Some(s) = app.try_state::<SuppressBlurHide>() {
+        s.0.store(false, Ordering::SeqCst);
+    }
+
+    picked.map(|handle| handle.path().to_string_lossy().to_string())
+}
+
+/// Registers a folder as a project (creating it if new) and kicks off a
+/// scan in the background on a fresh connection — so a newly added project
+/// starts showing up in search within moments, without blocking the UI or
+/// holding up the shared connection other searches use.
+#[tauri::command]
+fn add_project(state: tauri::State<DbState>, name: String, path: String) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Project name can't be empty".into());
+    }
+    let root = std::path::PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err("That's not a folder".into());
+    }
+
+    {
+        let conn = state.0.lock().map_err(|e| e.to_string())?;
+        let project_id =
+            lumos_core::metadata::get_or_create_project(&conn, name).map_err(|e| e.to_string())?;
+        lumos_core::metadata::register_project_path(&conn, project_id, &root)
+            .map_err(|e| e.to_string())?;
+    }
+
+    std::thread::spawn(move || {
+        if let Ok(conn) = lumos_core::db::open(&lumos_core::db::default_db_path()) {
+            let _ = lumos_core::scan::scan_path(&conn, &root);
+        }
+    });
+
+    Ok(())
+}
+
 fn toggle_overlay(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window("overlay") else {
         return;
@@ -215,7 +277,9 @@ pub fn run() {
             search_files,
             hide_overlay,
             open_file,
-            reveal_in_explorer
+            reveal_in_explorer,
+            pick_folder,
+            add_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

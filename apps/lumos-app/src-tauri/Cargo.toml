@@ -27,6 +27,7 @@ lumos-core = { path = "../../../crates/lumos-core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 anyhow = "1"
 open = "5"
+rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
