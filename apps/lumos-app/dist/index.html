@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Lumos</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="shell">
+    <div id="search-row">
+      <svg id="search-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="7"></circle>
+        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+      </svg>
+      <input id="query" type="text" placeholder="Search files…" autocomplete="off" spellcheck="false" />
+      <span id="hint">↵ open · ⌃↵ reveal · Esc</span>
+    </div>
+    <div id="results"></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
