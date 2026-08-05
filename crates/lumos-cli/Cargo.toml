@@ -1,0 +1,14 @@
+[package]
+name = "lumos-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lumos"
+path = "src/main.rs"
+
+[dependencies]
+lumos-core = { path = "../lumos-core" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
