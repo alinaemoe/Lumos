@@ -3,10 +3,19 @@ const { listen } = window.__TAURI__.event;
 
 const queryEl = document.getElementById("query");
 const resultsEl = document.getElementById("results");
+const addProjectBtn = document.getElementById("add-project-btn");
+const dragVeilEl = document.getElementById("drag-veil");
 
 let results = [];
 let selected = 0;
 let debounceTimer = null;
+
+// "search" | "add-project" — gates which keyboard/click handlers are live,
+// so opening the add-project panel can't accidentally "open" a stale search
+// result via Enter, and Escape backs out of the panel instead of closing
+// the whole overlay.
+let mode = "search";
+let pendingProjectPath = null;
 
 const EXT_STYLE = {
   js: ["JS", "#e6b400"], jsx: ["JSX", "#e6b400"], ts: ["TS", "#3178c6"], tsx: ["TSX", "#3178c6"],
@@ -27,6 +36,10 @@ function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // Rebuilds the DOM — only when the result *set* changes (new search, or the
@@ -80,10 +93,6 @@ function scrollSelectedIntoView() {
   if (selectedEl) selectedEl.scrollIntoView({ block: "nearest" });
 }
 
-function escapeHtml(s) {
-  return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
 async function runSearch(query) {
   if (!query.trim()) {
     results = [];
@@ -101,26 +110,118 @@ async function runSearch(query) {
 }
 
 // The Rust side handles whether the overlay hides or stays put — it drops
-// always-on-top and waits briefly to see if focus bounces back (dialog
-// cancelled) or moves on for good (file opened) before deciding.
-function activate(r, mode) {
+// always-on-top and waits as long as it takes to see if focus bounces back
+// (dialog cancelled) or moves on for good (file opened) before deciding.
+function activate(r, action) {
   if (!r) return;
-  if (mode === "reveal") {
+  if (action === "reveal") {
     invoke("reveal_in_explorer", { path: r.path });
   } else {
     invoke("open_file", { path: r.path });
   }
 }
 
+// ---- Add-project mode ----
+
+function nameFromPath(path) {
+  const cleaned = path.replace(/[\\/]+$/, "");
+  return cleaned.split(/[\\/]/).pop() || "";
+}
+
+function renderAddProjectView(status) {
+  const hasPath = Boolean(pendingProjectPath);
+  resultsEl.innerHTML = `
+    <div id="add-project-view">
+      <div id="drop-zone" class="${hasPath ? "has-path" : ""}">
+        <div class="drop-icon">📁</div>
+        <div class="drop-text">${hasPath ? "Folder selected — change it?" : "Drop a folder here or click to browse"}</div>
+        ${hasPath ? `<div class="drop-path">${escapeHtml(pendingProjectPath)}</div>` : ""}
+      </div>
+      <div id="add-project-form">
+        <input id="project-name-input" placeholder="Project name" autocomplete="off" spellcheck="false" value="${escapeHtml(nameFromPath(pendingProjectPath || ""))}" />
+        <button id="add-project-confirm" ${hasPath ? "" : "disabled"}>Add</button>
+      </div>
+      <div id="add-project-status" class="${status?.kind || ""}">${status?.text || ""}</div>
+    </div>`;
+}
+
+function enterAddProjectMode() {
+  mode = "add-project";
+  pendingProjectPath = null;
+  addProjectBtn.classList.add("active");
+  renderAddProjectView();
+}
+
+function exitAddProjectMode() {
+  mode = "search";
+  pendingProjectPath = null;
+  addProjectBtn.classList.remove("active");
+  queryEl.value = "";
+  results = [];
+  selected = 0;
+  renderResults();
+  queryEl.focus();
+}
+
+async function pickFolder() {
+  const path = await invoke("pick_folder");
+  if (path) {
+    pendingProjectPath = path;
+    renderAddProjectView();
+    resultsEl.querySelector("#project-name-input")?.focus();
+  }
+}
+
+async function confirmAddProject() {
+  const nameInput = resultsEl.querySelector("#project-name-input");
+  const name = nameInput?.value.trim();
+  if (!pendingProjectPath || !name) return;
+
+  const confirmBtn = resultsEl.querySelector("#add-project-confirm");
+  if (confirmBtn) confirmBtn.disabled = true;
+  renderAddProjectView({ kind: "", text: "Adding…" });
+
+  try {
+    await invoke("add_project", { name, path: pendingProjectPath });
+    renderAddProjectView({ kind: "success", text: "✓ Added — scanning in the background" });
+    setTimeout(exitAddProjectMode, 1100);
+  } catch (e) {
+    renderAddProjectView({ kind: "error", text: String(e) });
+    resultsEl.querySelector("#project-name-input")?.focus();
+  }
+}
+
+// ---- Input wiring ----
+
 queryEl.addEventListener("input", () => {
+  if (mode !== "search") return;
   clearTimeout(debounceTimer);
   const q = queryEl.value;
   debounceTimer = setTimeout(() => runSearch(q), 120);
 });
 
+addProjectBtn.addEventListener("click", () => {
+  if (mode === "add-project") {
+    exitAddProjectMode();
+  } else {
+    enterAddProjectMode();
+  }
+});
+
 // Attached to document, not just the input: clicking a result row shouldn't
 // be able to strand keyboard navigation by moving focus off the input.
 document.addEventListener("keydown", (e) => {
+  if (mode === "add-project") {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      exitAddProjectMode();
+    } else if (e.key === "Enter" && document.activeElement?.id === "project-name-input") {
+      e.preventDefault();
+      confirmAddProject();
+    }
+    return;
+  }
+
   if (e.key === "ArrowDown") {
     e.preventDefault();
     if (results.length) {
@@ -143,6 +244,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 resultsEl.addEventListener("mouseover", (e) => {
+  if (mode !== "search") return;
   const row = e.target.closest(".result");
   if (!row) return;
   const idx = Number(row.dataset.index);
@@ -153,13 +255,57 @@ resultsEl.addEventListener("mouseover", (e) => {
 });
 
 resultsEl.addEventListener("click", (e) => {
+  if (mode === "add-project") {
+    if (e.target.closest("#drop-zone")) {
+      pickFolder();
+    } else if (e.target.closest("#add-project-confirm")) {
+      confirmAddProject();
+    }
+    return;
+  }
   const row = e.target.closest(".result");
   if (!row) return;
   const idx = Number(row.dataset.index);
   activate(results[idx], e.ctrlKey ? "reveal" : "open");
 });
 
+// ---- OS-level drag and drop (works from anywhere in the window, not just
+// the drop-zone — dropping a folder auto-opens the add-project panel) ----
+// Uses the documented onDragDropEvent API (payload.type: "over" | "drop" |
+// anything else for cancel/leave) rather than guessing raw event-name
+// strings, which aren't part of the stable public surface.
+
+const dragDropSource =
+  window.__TAURI__.webview?.getCurrentWebview?.() ??
+  window.__TAURI__.webviewWindow?.getCurrentWebviewWindow?.();
+
+if (dragDropSource?.onDragDropEvent) {
+  dragDropSource.onDragDropEvent((event) => {
+    const payload = event.payload;
+    if (payload.type === "over") {
+      dragVeilEl.classList.add("visible");
+    } else if (payload.type === "drop") {
+      dragVeilEl.classList.remove("visible");
+      const paths = payload.paths;
+      if (Array.isArray(paths) && paths.length > 0) {
+        pendingProjectPath = paths[0];
+        if (mode !== "add-project") {
+          mode = "add-project";
+          addProjectBtn.classList.add("active");
+        }
+        renderAddProjectView();
+        resultsEl.querySelector("#project-name-input")?.focus();
+      }
+    } else {
+      dragVeilEl.classList.remove("visible");
+    }
+  });
+} else {
+  console.warn("drag-drop API unavailable — folder picker button still works");
+}
+
 listen("overlay-shown", () => {
+  if (mode === "add-project") return; // preserve in-progress add flow across toggles
   queryEl.value = "";
   results = [];
   selected = 0;
