@@ -1,7 +1,8 @@
 mod autostart;
+mod clipboard_watcher;
 mod hotkey;
 
-use lumos_core::{db, search::SearchResult};
+use lumos_core::{db, search::SearchHit};
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,9 +16,15 @@ struct DbState(Arc<Mutex<Connection>>);
 struct SuppressBlurHide(AtomicBool);
 
 #[tauri::command]
-fn search_files(state: tauri::State<DbState>, query: String) -> Result<Vec<SearchResult>, String> {
+fn search_files(state: tauri::State<DbState>, query: String) -> Result<Vec<SearchHit>, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    lumos_core::search::search(&conn, &query, 30).map_err(|e| e.to_string())
+    lumos_core::search::search_all(&conn, &query, 30).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn copy_to_clipboard(text: String) -> Result<(), String> {
+    clipboard_win::set_clipboard(clipboard_win::formats::Unicode, &text)
+        .map_err(|e| format!("failed to set clipboard: {e}"))
 }
 
 #[tauri::command]
@@ -304,6 +311,14 @@ pub fn run() {
                 });
             }
 
+            #[cfg(windows)]
+            {
+                let app_handle = app.handle().clone();
+                clipboard_watcher::spawn(move || {
+                    let _ = app_handle.emit("clipboard-updated", ());
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -312,7 +327,8 @@ pub fn run() {
             open_file,
             reveal_in_explorer,
             pick_folder,
-            add_project
+            add_project,
+            copy_to_clipboard
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
