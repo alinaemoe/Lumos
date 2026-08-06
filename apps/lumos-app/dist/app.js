@@ -128,19 +128,27 @@ function nameFromPath(path) {
   return cleaned.split(/[\\/]/).pop() || "";
 }
 
+// The name field and Add button only appear once a folder is actually
+// picked — showing them up front (as an always-present text box) read as
+// "is this a search box?" rather than "name your new project", since it
+// looked like just another input sitting next to a drop-zone.
 function renderAddProjectView(status) {
   const hasPath = Boolean(pendingProjectPath);
+  const form = hasPath
+    ? `<div id="add-project-form">
+        <input id="project-name-input" placeholder="Name this project…" autocomplete="off" spellcheck="false" value="${escapeHtml(nameFromPath(pendingProjectPath))}" />
+        <button id="add-project-confirm">Add</button>
+      </div>`
+    : "";
+
   resultsEl.innerHTML = `
     <div id="add-project-view">
       <div id="drop-zone" class="${hasPath ? "has-path" : ""}">
         <div class="drop-icon">📁</div>
-        <div class="drop-text">${hasPath ? "Folder selected — change it?" : "Drop a folder here or click to browse"}</div>
+        <div class="drop-text">${hasPath ? "Folder selected — click to change" : "Drop a folder here or click to browse"}</div>
         ${hasPath ? `<div class="drop-path">${escapeHtml(pendingProjectPath)}</div>` : ""}
       </div>
-      <div id="add-project-form">
-        <input id="project-name-input" placeholder="Project name" autocomplete="off" spellcheck="false" value="${escapeHtml(nameFromPath(pendingProjectPath || ""))}" />
-        <button id="add-project-confirm" ${hasPath ? "" : "disabled"}>Add</button>
-      </div>
+      ${form}
       <div id="add-project-status" class="${status?.kind || ""}">${status?.text || ""}</div>
     </div>`;
 }
@@ -152,10 +160,17 @@ function enterAddProjectMode() {
   renderAddProjectView();
 }
 
-function exitAddProjectMode() {
+// Leaves add-project mode without touching the search box's value — used
+// when the user starts interacting with the search input directly, which
+// should hand control back to search immediately, not lose what they typed.
+function leaveAddProjectMode() {
   mode = "search";
   pendingProjectPath = null;
   addProjectBtn.classList.remove("active");
+}
+
+function exitAddProjectMode() {
+  leaveAddProjectMode();
   queryEl.value = "";
   results = [];
   selected = 0;
@@ -193,8 +208,20 @@ async function confirmAddProject() {
 
 // ---- Input wiring ----
 
+// Touching the search box — clicking into it or typing — always means "I
+// want to search", so it backs out of add-project mode instead of eating
+// the interaction.
+queryEl.addEventListener("focus", () => {
+  if (mode === "add-project") {
+    leaveAddProjectMode();
+    renderResults();
+  }
+});
+
 queryEl.addEventListener("input", () => {
-  if (mode !== "search") return;
+  if (mode === "add-project") {
+    leaveAddProjectMode();
+  }
   clearTimeout(debounceTimer);
   const q = queryEl.value;
   debounceTimer = setTimeout(() => runSearch(q), 120);
