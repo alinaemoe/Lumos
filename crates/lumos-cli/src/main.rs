@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use lumos_core::{db, metadata, scan, search, watcher};
+use lumos_core::{clipboard, db, metadata, scan, search, watcher};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -35,6 +35,26 @@ enum Command {
     Search {
         query: String,
     },
+    /// Clipboard history — mainly for testing the monitor without a live
+    /// clipboard listener attached.
+    Clipboard {
+        #[command(subcommand)]
+        action: ClipboardAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClipboardAction {
+    /// Feed a piece of text through the same path a real clipboard copy
+    /// would take (classification + dedup against the last entry).
+    Record { text: String },
+    /// Most recent clipboard entries, newest first.
+    List {
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
+    /// FTS5 search over clipboard history.
+    Search { query: String },
 }
 
 #[derive(Subcommand)]
@@ -55,6 +75,7 @@ fn main() -> Result<()> {
         Command::Scan { path } => run_scan(&conn, &path)?,
         Command::Watch { paths } => run_watch(&conn, paths)?,
         Command::Search { query } => run_search(&conn, &query)?,
+        Command::Clipboard { action } => run_clipboard(&conn, action)?,
     }
 
     Ok(())
@@ -123,6 +144,40 @@ fn run_search(conn: &Connection, query: &str) -> Result<()> {
     for r in results {
         let project = r.project_name.as_deref().unwrap_or("-");
         println!("{}  ({} bytes, project={})", r.path, r.size, project);
+    }
+    Ok(())
+}
+
+fn print_clip(c: &clipboard::ClipboardResult) {
+    let preview: String = c.text_content.chars().take(80).collect();
+    let preview = preview.replace('\n', "⏎");
+    println!("[{}] #{} {}: {}", c.created_at, c.id, c.detected_type, preview);
+}
+
+fn run_clipboard(conn: &Connection, action: ClipboardAction) -> Result<()> {
+    match action {
+        ClipboardAction::Record { text } => match clipboard::record_text(conn, &text)? {
+            Some(id) => println!("recorded #{id} (type: {})", clipboard::classify(&text)),
+            None => println!("skipped (empty or duplicate of last entry)"),
+        },
+        ClipboardAction::List { limit } => {
+            let entries = clipboard::recent(conn, limit)?;
+            if entries.is_empty() {
+                println!("no clipboard history yet");
+            }
+            for c in entries {
+                print_clip(&c);
+            }
+        }
+        ClipboardAction::Search { query } => {
+            let entries = clipboard::search(conn, &query, 20)?;
+            if entries.is_empty() {
+                println!("no matches for {query:?}");
+            }
+            for c in entries {
+                print_clip(&c);
+            }
+        }
     }
     Ok(())
 }
