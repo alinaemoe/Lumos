@@ -177,13 +177,27 @@ async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
     picked.map(|handle| handle.path().to_string_lossy().to_string())
 }
 
+#[derive(Clone, serde::Serialize)]
+struct ScanProgress {
+    project: String,
+    status: String, // "started" | "finished"
+    indexed: Option<u64>,
+}
+
 /// Registers a folder as a project (creating it if new) and kicks off a
 /// scan in the background on a fresh connection — so a newly added project
 /// starts showing up in search within moments, without blocking the UI or
-/// holding up the shared connection other searches use.
+/// holding up the shared connection other searches use. Emits `scan-progress`
+/// events so the overlay can show that something's happening instead of the
+/// scan being entirely invisible until you happen to search for it.
 #[tauri::command]
-fn add_project(state: tauri::State<DbState>, name: String, path: String) -> Result<(), String> {
-    let name = name.trim();
+fn add_project(
+    app: tauri::AppHandle,
+    state: tauri::State<DbState>,
+    name: String,
+    path: String,
+) -> Result<(), String> {
+    let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Project name can't be empty".into());
     }
@@ -195,15 +209,34 @@ fn add_project(state: tauri::State<DbState>, name: String, path: String) -> Resu
     {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let project_id =
-            lumos_core::metadata::get_or_create_project(&conn, name).map_err(|e| e.to_string())?;
+            lumos_core::metadata::get_or_create_project(&conn, &name).map_err(|e| e.to_string())?;
         lumos_core::metadata::register_project_path(&conn, project_id, &root)
             .map_err(|e| e.to_string())?;
     }
 
+    let _ = app.emit(
+        "scan-progress",
+        ScanProgress {
+            project: name.clone(),
+            status: "started".into(),
+            indexed: None,
+        },
+    );
+
     std::thread::spawn(move || {
-        if let Ok(conn) = lumos_core::db::open(&lumos_core::db::default_db_path()) {
-            let _ = lumos_core::scan::scan_path(&conn, &root);
-        }
+        let indexed = lumos_core::db::open(&lumos_core::db::default_db_path())
+            .ok()
+            .and_then(|conn| lumos_core::scan::scan_path(&conn, &root).ok())
+            .map(|stats| stats.indexed);
+
+        let _ = app.emit(
+            "scan-progress",
+            ScanProgress {
+                project: name,
+                status: "finished".into(),
+                indexed,
+            },
+        );
     });
 
     Ok(())
