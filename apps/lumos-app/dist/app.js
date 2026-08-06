@@ -411,9 +411,16 @@ function hideSuggestions() {
 
 function acceptSuggestion(value) {
   const { start } = currentToken();
-  queryEl.value = queryEl.value.slice(0, start) + value + " ";
-  hideSuggestions();
+  // "type:" is a partial filter still expecting its value glued on right
+  // after the colon (`type:jwt`, not `type: jwt`) — only a *complete*
+  // filter gets a trailing space, since that's where free text resumes.
+  const suffix = value.endsWith(":") ? "" : " ";
+  queryEl.value = queryEl.value.slice(0, start) + value + suffix;
   updateClearButton();
+  // Recompute rather than hide outright: accepting "type:" should
+  // immediately offer the list of type values, not force another keystroke
+  // first — same "keep going" feel as a real command-palette autocomplete.
+  renderSuggestions();
   clearTimeout(debounceTimer);
   const q = queryEl.value;
   debounceTimer = setTimeout(() => runSearch(q), 120);
