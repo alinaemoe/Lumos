@@ -98,9 +98,9 @@ html, body {
 }
 
 #add-project-btn.active {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
+  background: var(--selected-bg);
+  color: var(--accent);
+  border-color: rgba(124, 138, 255, 0.35);
 }
 
 #results {
