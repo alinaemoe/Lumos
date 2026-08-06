@@ -399,6 +399,7 @@ function updateSuggestionHighlight() {
   suggestionsEl.querySelectorAll(".suggestion").forEach((el, i) => {
     el.classList.toggle("active", i === suggestionIndex);
   });
+  suggestionsEl.children[suggestionIndex]?.scrollIntoView({ block: "nearest" });
 }
 
 function hideSuggestions() {
@@ -422,6 +423,18 @@ function acceptSuggestion(value) {
 suggestionsEl.addEventListener("click", (e) => {
   const item = e.target.closest(".suggestion");
   if (item) acceptSuggestion(item.dataset.value);
+});
+
+// Keeps keyboard and mouse in sync — hovering a suggestion moves the
+// keyboard-selected index too, same convention as the results list.
+suggestionsEl.addEventListener("mouseover", (e) => {
+  const item = e.target.closest(".suggestion");
+  if (!item) return;
+  const idx = Array.from(suggestionsEl.children).indexOf(item);
+  if (idx !== -1 && idx !== suggestionIndex) {
+    suggestionIndex = idx;
+    updateSuggestionHighlight();
+  }
 });
 
 // ---- Input wiring ----

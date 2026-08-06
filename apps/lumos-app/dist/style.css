@@ -201,7 +201,8 @@ html, body {
   border: 1px solid var(--border);
   border-radius: 9px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-  overflow: hidden;
+  max-height: 220px;
+  overflow-y: auto;
   opacity: 0;
   pointer-events: none;
   transform: translateY(-4px);
@@ -214,6 +215,14 @@ html, body {
   transform: translateY(0);
 }
 
+#suggestions::-webkit-scrollbar {
+  width: 8px;
+}
+#suggestions::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+}
+
 .suggestion {
   padding: 7px 12px;
   font-size: 12.5px;
@@ -223,6 +232,7 @@ html, body {
   background: #232327;
 }
 
+.suggestion:hover,
 .suggestion.active {
   background: var(--selected-bg);
   color: var(--text);
