@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use lumos_core::{clipboard, db, metadata, scan, search, watcher};
+use lumos_core::{clipboard, db, embeddings, metadata, scan, search, watcher};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -35,12 +35,21 @@ enum Command {
     Search {
         query: String,
     },
+    /// The real unified search (FTS5 + semantic, files + clipboard) — same
+    /// call the overlay UI makes.
+    SearchAll {
+        query: String,
+    },
     /// Clipboard history — mainly for testing the monitor without a live
     /// clipboard listener attached.
     Clipboard {
         #[command(subcommand)]
         action: ClipboardAction,
     },
+    /// Semantic search backfill — downloads the embedding model on first
+    /// run (needs network once), then embeds any file/clipboard row that
+    /// doesn't have a vector yet.
+    Embed,
 }
 
 #[derive(Subcommand)]
@@ -82,7 +91,9 @@ fn main() -> Result<()> {
         Command::Scan { path } => run_scan(&conn, &path)?,
         Command::Watch { paths } => run_watch(&conn, paths)?,
         Command::Search { query } => run_search(&conn, &query)?,
+        Command::SearchAll { query } => run_search_all(&conn, &query)?,
         Command::Clipboard { action } => run_clipboard(&conn, action)?,
+        Command::Embed => run_embed(&conn)?,
     }
 
     Ok(())
@@ -155,6 +166,24 @@ fn run_search(conn: &Connection, query: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_search_all(conn: &Connection, query: &str) -> Result<()> {
+    let hits = search::search_all(conn, query, 20)?;
+    if hits.is_empty() {
+        println!("no matches for {query:?}");
+        return Ok(());
+    }
+    for hit in hits {
+        match hit {
+            search::SearchHit::File(f) => println!("[file] {} (project={})", f.path, f.project_name.unwrap_or_else(|| "-".into())),
+            search::SearchHit::Clipboard(c) => {
+                let preview: String = c.text_content.chars().take(80).collect();
+                println!("[clip:{}] {}", c.detected_type, preview.replace('\n', "⏎"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn print_clip(c: &clipboard::ClipboardResult) {
     let preview: String = c.text_content.chars().take(80).collect();
     let preview = preview.replace('\n', "⏎");
@@ -201,5 +230,34 @@ fn run_clipboard(conn: &Connection, action: ClipboardAction) -> Result<()> {
             println!("removed {removed} entr{} older than {days} day(s)", if removed == 1 { "y" } else { "ies" });
         }
     }
+    Ok(())
+}
+
+fn run_embed(conn: &Connection) -> Result<()> {
+    if !embeddings::is_available() {
+        println!("embedding model unavailable (no network on first run, or it failed to load) — semantic search stays off, FTS keeps working");
+        return Ok(());
+    }
+
+    let file_ids = embeddings::missing(conn, "file", "files")?;
+    println!("embedding {} file(s)...", file_ids.len());
+    for id in file_ids {
+        let filename: String = conn.query_row("SELECT filename FROM files WHERE id = ?1", [id], |r| r.get(0))?;
+        embeddings::store(conn, "file", id, &filename)?;
+    }
+
+    let clip_ids = embeddings::missing(conn, "clipboard", "clipboard_entries")?;
+    println!(
+        "embedding {} clipboard entr{}...",
+        clip_ids.len(),
+        if clip_ids.len() == 1 { "y" } else { "ies" }
+    );
+    for id in clip_ids {
+        let text: String =
+            conn.query_row("SELECT text_content FROM clipboard_entries WHERE id = ?1", [id], |r| r.get(0))?;
+        embeddings::store(conn, "clipboard", id, &text)?;
+    }
+
+    println!("done");
     Ok(())
 }
