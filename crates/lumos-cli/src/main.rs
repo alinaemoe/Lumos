@@ -238,26 +238,7 @@ fn run_embed(conn: &Connection) -> Result<()> {
         println!("embedding model unavailable (no network on first run, or it failed to load) — semantic search stays off, FTS keeps working");
         return Ok(());
     }
-
-    let file_ids = embeddings::missing(conn, "file", "files")?;
-    println!("embedding {} file(s)...", file_ids.len());
-    for id in file_ids {
-        let filename: String = conn.query_row("SELECT filename FROM files WHERE id = ?1", [id], |r| r.get(0))?;
-        embeddings::store(conn, "file", id, &filename)?;
-    }
-
-    let clip_ids = embeddings::missing(conn, "clipboard", "clipboard_entries")?;
-    println!(
-        "embedding {} clipboard entr{}...",
-        clip_ids.len(),
-        if clip_ids.len() == 1 { "y" } else { "ies" }
-    );
-    for id in clip_ids {
-        let text: String =
-            conn.query_row("SELECT text_content FROM clipboard_entries WHERE id = ?1", [id], |r| r.get(0))?;
-        embeddings::store(conn, "clipboard", id, &text)?;
-    }
-
-    println!("done");
+    let (files, clips) = embeddings::backfill_all(conn)?;
+    println!("embedded {files} file(s), {clips} clipboard entr{}", if clips == 1 { "y" } else { "ies" });
     Ok(())
 }
