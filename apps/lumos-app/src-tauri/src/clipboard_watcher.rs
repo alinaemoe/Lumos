@@ -11,7 +11,7 @@ use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub fn spawn(emit: impl Fn() + Send + 'static) {
+pub fn spawn() {
     std::thread::spawn(move || {
         let last_seq = AtomicU32::new(unsafe { GetClipboardSequenceNumber() });
         let Ok(conn) = lumos_core::db::open(&lumos_core::db::default_db_path()) else {
@@ -33,10 +33,8 @@ pub fn spawn(emit: impl Fn() + Send + 'static) {
                 continue; // non-text clipboard content (image, files, etc.) — out of scope for now
             };
 
-            match lumos_core::clipboard::record_text(&conn, &text) {
-                Ok(Some(_)) => emit(),
-                Ok(None) => {}
-                Err(e) => log::warn!("clipboard watcher: failed to record entry: {e}"),
+            if let Err(e) = lumos_core::clipboard::record_text(&conn, &text) {
+                log::warn!("clipboard watcher: failed to record entry: {e}");
             }
         }
     });

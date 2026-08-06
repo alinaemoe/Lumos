@@ -312,12 +312,7 @@ pub fn run() {
             }
 
             #[cfg(windows)]
-            {
-                let app_handle = app.handle().clone();
-                clipboard_watcher::spawn(move || {
-                    let _ = app_handle.emit("clipboard-updated", ());
-                });
-            }
+            clipboard_watcher::spawn();
 
             Ok(())
         })
