@@ -10,6 +10,7 @@ const searchIconEl = document.getElementById("search-icon");
 const clearBtn = document.getElementById("clear-btn");
 const scanBarEl = document.getElementById("scan-status-bar");
 const scanBarTextEl = document.getElementById("scan-status-text");
+const suggestionsEl = document.getElementById("suggestions");
 
 let results = [];
 let selected = 0;
@@ -37,8 +38,22 @@ const EXT_STYLE = {
 const CLIP_STYLE = {
   json: ["{ }", "#8bc34a"], sql: ["SQL", "#4a90a4"], jwt: ["JWT", "#c46dd0"],
   uuid: ["ID", "#5a5a63"], stacktrace: ["ERR", "#e8734a"], url: ["URL", "#5b9dd9"],
-  text: ["TXT", "#6b6b73"],
+  text: ["TXT", "#6b6b73"], secret: ["KEY", "#e05252"], hash: ["#", "#8c8c94"],
+  ip_address: ["IP", "#5b9dd9"], email: ["@", "#e0a34a"], connection_string: ["DSN", "#4a90a4"],
+  terminal_command: [">_", "#41b883"], env_block: ["ENV", "#a970ff"], yaml: ["YML", "#a970ff"],
+  xml_html: ["</>", "#e8734a"], file_path: ["DIR", "#8b8b93"], color: ["●", "#c46dd0"],
+  date: ["DATE", "#5a5a63"],
 };
+
+// type: filter values, in the same order the classifier checks them —
+// autocomplete should offer the ones people actually get, in a sensible
+// order, not an alphabetical shuffle.
+const TYPE_VALUES = [
+  "jwt", "uuid", "secret", "hash", "ip_address", "email", "json", "sql", "stacktrace",
+  "connection_string", "terminal_command", "env_block", "yaml", "xml_html", "file_path", "url",
+  "color", "date", "text",
+];
+const TIME_VALUES = ["today", "yesterday", "week"];
 
 function iconFor(ext) {
   const key = (ext || "").toLowerCase();
@@ -113,14 +128,16 @@ function renderResults() {
     .map((r, i) => {
       if (r.kind === "clipboard") {
         const [label, color] = clipIconFor(r.detected_type);
+        const source = r.source_app ? ` · ${escapeHtml(r.source_app)}` : "";
         return `
           <div class="result ${i === selected ? "selected" : ""}" data-index="${i}">
             <div class="file-icon" style="background:${color}">${label}</div>
             <div class="result-text">
               <div class="result-name">${highlightText(clipboardPreview(r.text_content), currentQuery)}</div>
-              <div class="result-path">Clipboard · ${formatRelativeTime(r.created_at)}</div>
+              <div class="result-path">Clipboard${source} · ${formatRelativeTime(r.created_at)}</div>
             </div>
             <div class="result-meta">
+              <button class="pin-btn ${r.pinned ? "pinned" : ""}" data-clip-id="${r.id}" title="${r.pinned ? "Unpin" : "Pin"}">📌</button>
               <span class="badge">${escapeHtml(r.detected_type)}</span>
             </div>
           </div>`;
@@ -186,6 +203,7 @@ function clearSearch() {
   results = [];
   selected = 0;
   updateClearButton();
+  hideSuggestions();
   renderResults();
   queryEl.focus();
 }
@@ -243,6 +261,7 @@ function enterAddProjectMode() {
   mode = "add-project";
   pendingProjectPath = null;
   addProjectBtn.classList.add("active");
+  hideSuggestions();
   renderAddProjectView();
 }
 
@@ -328,6 +347,80 @@ listen("scan-progress", (event) => {
   }
 });
 
+// ---- Filter autocomplete (type:, today/yesterday/week) ----
+//
+// Predictable-on-purpose: it only ever looks at the token currently being
+// typed (the chunk after the last space), and only offers something when
+// that token is actually a prefix of a real filter — no fuzzy matching, no
+// suggestions appearing out of nowhere. Arrow keys/Tab/Enter behave exactly
+// like every other autocomplete: the dropdown, when open, owns those keys.
+
+let suggestions = [];
+let suggestionIndex = 0;
+
+function currentToken() {
+  const val = queryEl.value;
+  const start = val.lastIndexOf(" ") + 1;
+  return { token: val.slice(start), start };
+}
+
+function computeSuggestions() {
+  const { token } = currentToken();
+  if (!token) return [];
+
+  const lower = token.toLowerCase();
+  if (lower.startsWith("type:")) {
+    const partial = lower.slice(5);
+    return TYPE_VALUES.filter((t) => t.startsWith(partial)).map((t) => `type:${t}`);
+  }
+  const timeMatches = TIME_VALUES.filter((t) => t.startsWith(lower) && t !== lower);
+  if (timeMatches.length) return timeMatches;
+  if (lower.length > 0 && "type:".startsWith(lower)) return ["type:"];
+  return [];
+}
+
+function renderSuggestions() {
+  suggestions = computeSuggestions();
+  suggestionIndex = 0;
+  if (!suggestions.length) {
+    suggestionsEl.classList.remove("visible");
+    suggestionsEl.innerHTML = "";
+    return;
+  }
+  suggestionsEl.innerHTML = suggestions
+    .map((s, i) => `<div class="suggestion ${i === 0 ? "active" : ""}" data-value="${escapeHtml(s)}">${escapeHtml(s)}</div>`)
+    .join("");
+  suggestionsEl.classList.add("visible");
+}
+
+function updateSuggestionHighlight() {
+  suggestionsEl.querySelectorAll(".suggestion").forEach((el, i) => {
+    el.classList.toggle("active", i === suggestionIndex);
+  });
+}
+
+function hideSuggestions() {
+  suggestions = [];
+  suggestionsEl.classList.remove("visible");
+  suggestionsEl.innerHTML = "";
+}
+
+function acceptSuggestion(value) {
+  const { start } = currentToken();
+  queryEl.value = queryEl.value.slice(0, start) + value + " ";
+  hideSuggestions();
+  updateClearButton();
+  clearTimeout(debounceTimer);
+  const q = queryEl.value;
+  debounceTimer = setTimeout(() => runSearch(q), 120);
+  queryEl.focus();
+}
+
+suggestionsEl.addEventListener("click", (e) => {
+  const item = e.target.closest(".suggestion");
+  if (item) acceptSuggestion(item.dataset.value);
+});
+
 // ---- Input wiring ----
 
 // Touching the search box — clicking into it or typing — always means "I
@@ -345,6 +438,7 @@ queryEl.addEventListener("input", () => {
     leaveAddProjectMode();
   }
   updateClearButton();
+  renderSuggestions();
   clearTimeout(debounceTimer);
   const q = queryEl.value;
   debounceTimer = setTimeout(() => runSearch(q), 120);
@@ -374,6 +468,44 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  if (e.key === "Escape") {
+    e.preventDefault();
+    if (suggestions.length) {
+      hideSuggestions();
+      return;
+    }
+    // First Escape clears an active query (instant-clear hotkey); only a
+    // second press — once there's nothing left to clear — hides Lumos.
+    if (queryEl.value.length > 0) {
+      clearSearch();
+    } else {
+      invoke("hide_overlay");
+    }
+    return;
+  }
+
+  // The suggestion dropdown, while open, owns navigation/accept keys —
+  // same convention as every other autocomplete (command palettes, IDEs).
+  if (suggestions.length) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      suggestionIndex = (suggestionIndex + 1) % suggestions.length;
+      updateSuggestionHighlight();
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      suggestionIndex = (suggestionIndex - 1 + suggestions.length) % suggestions.length;
+      updateSuggestionHighlight();
+      return;
+    }
+    if (e.key === "Tab" || e.key === "Enter") {
+      e.preventDefault();
+      acceptSuggestion(suggestions[suggestionIndex]);
+      return;
+    }
+  }
+
   if (e.key === "ArrowDown") {
     e.preventDefault();
     if (results.length) {
@@ -385,15 +517,6 @@ document.addEventListener("keydown", (e) => {
     if (results.length) {
       selected = (selected - 1 + results.length) % results.length;
       updateSelection();
-    }
-  } else if (e.key === "Escape") {
-    e.preventDefault();
-    // First Escape clears an active query (instant-clear hotkey); only a
-    // second press — once there's nothing left to clear — hides Lumos.
-    if (queryEl.value.length > 0) {
-      clearSearch();
-    } else {
-      invoke("hide_overlay");
     }
   } else if (e.key === "Enter") {
     e.preventDefault();
@@ -412,6 +535,20 @@ resultsEl.addEventListener("mouseover", (e) => {
   }
 });
 
+async function togglePin(button) {
+  const id = Number(button.dataset.clipId);
+  const entry = results.find((r) => r.kind === "clipboard" && r.id === id);
+  if (!entry) return;
+  const nextPinned = !entry.pinned;
+  try {
+    await invoke("toggle_pin", { id, pinned: nextPinned });
+    entry.pinned = nextPinned;
+    renderResults();
+  } catch (e) {
+    console.error("failed to toggle pin", e);
+  }
+}
+
 resultsEl.addEventListener("click", (e) => {
   if (mode === "add-project") {
     if (e.target.closest("#drop-zone")) {
@@ -419,6 +556,12 @@ resultsEl.addEventListener("click", (e) => {
     } else if (e.target.closest("#add-project-confirm")) {
       confirmAddProject();
     }
+    return;
+  }
+  const pinBtn = e.target.closest(".pin-btn");
+  if (pinBtn) {
+    e.stopPropagation();
+    togglePin(pinBtn);
     return;
   }
   const row = e.target.closest(".result");
@@ -476,6 +619,7 @@ listen("overlay-shown", () => {
   results = [];
   selected = 0;
   updateClearButton();
+  hideSuggestions();
   renderResults();
   queryEl.focus();
 });
