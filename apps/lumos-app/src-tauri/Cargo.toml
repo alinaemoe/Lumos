@@ -37,3 +37,4 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
 ] }
 winreg = "0.52"
+mslnk = "0.1"
