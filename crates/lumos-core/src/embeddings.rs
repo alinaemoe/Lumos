@@ -26,7 +26,7 @@ use ndarray::Axis;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tokenizers::{PaddingParams, Tokenizer};
@@ -94,6 +94,16 @@ impl Embedder {
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("loading tokenizer from {tokenizer_path:?}: {e}"))?;
         tokenizer.with_padding(Some(PaddingParams::default()));
+        // The model's position embeddings only go up to 512 — a long
+        // clipboard paste (up to 200KB of text) tokenizes to well past
+        // that, and without truncation ort throws a broadcast-shape error
+        // rather than anything resembling a helpful message about why.
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 512,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("configuring tokenizer truncation: {e}"))?;
 
         Ok(Self {
             session: Mutex::new(session),
@@ -238,6 +248,39 @@ pub fn missing(conn: &Connection, object_type: &str, table: &str) -> Result<Vec<
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([object_type], |row| row.get(0))?;
     rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Catches up anything that slipped through — a row inserted while the
+/// model was still downloading on first run, one from before this feature
+/// existed, whatever. Both the CLI (`lumos embed`) and the app's own
+/// startup pass call this; it's the one place that work is defined.
+/// Returns `(files_embedded, clipboard_entries_embedded)`.
+pub fn backfill_all(conn: &Connection) -> Result<(usize, usize)> {
+    if !is_available() {
+        return Ok((0, 0));
+    }
+
+    let file_ids = missing(conn, "file", "files")?;
+    for id in &file_ids {
+        let filename: Option<String> = conn
+            .query_row("SELECT filename FROM files WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        if let Some(filename) = filename {
+            store(conn, "file", *id, &filename)?;
+        }
+    }
+
+    let clip_ids = missing(conn, "clipboard", "clipboard_entries")?;
+    for id in &clip_ids {
+        let text: Option<String> = conn
+            .query_row("SELECT text_content FROM clipboard_entries WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        if let Some(text) = text {
+            store(conn, "clipboard", *id, &text)?;
+        }
+    }
+
+    Ok((file_ids.len(), clip_ids.len()))
 }
 
 /// Brute-force cosine search (vectors are pre-normalized, so this is just a

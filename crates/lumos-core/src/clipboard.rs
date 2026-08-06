@@ -332,7 +332,12 @@ pub fn record_text(conn: &Connection, text: &str, source_app: Option<&str>) -> R
     )
     .context("inserting clipboard entry")?;
 
-    Ok(Some(conn.last_insert_rowid()))
+    let id = conn.last_insert_rowid();
+    // Best-effort, same reasoning as the file indexer: a missed/failed
+    // embedding degrades semantic search quietly, not clipboard recording.
+    let _ = crate::embeddings::store(conn, "clipboard", id, capped);
+
+    Ok(Some(id))
 }
 
 fn row_to_result(row: &rusqlite::Row) -> rusqlite::Result<ClipboardResult> {
@@ -447,5 +452,13 @@ pub fn purge_older_than(conn: &Connection, days: i64) -> Result<usize> {
             [cutoff],
         )
         .context("purging old clipboard entries")?;
+    // No FK between embeddings and clipboard_entries (it's a generic
+    // object_type/object_id table shared with files), so orphans need an
+    // explicit sweep rather than an ON DELETE CASCADE.
+    conn.execute(
+        "DELETE FROM embeddings WHERE object_type = 'clipboard' AND object_id NOT IN (SELECT id FROM clipboard_entries)",
+        [],
+    )
+    .context("cleaning orphaned clipboard embeddings")?;
     Ok(removed)
 }

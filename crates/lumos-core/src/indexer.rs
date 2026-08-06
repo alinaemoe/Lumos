@@ -1,6 +1,6 @@
 use crate::metadata::resolve_project_for_path;
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -79,13 +79,28 @@ pub fn index_file(conn: &Connection, path: &Path) -> Result<()> {
     )
     .with_context(|| format!("upserting file {:?}", path))?;
 
+    // Best-effort — a filename embedding is small and quick (one short
+    // sequence through a small CPU model), and `store` itself no-ops
+    // silently if the model never loaded. Failures here shouldn't fail
+    // indexing over what's genuinely a search-quality nicety.
+    if let Ok(file_id) = conn.query_row("SELECT id FROM files WHERE path = ?1", [&path_str], |r| r.get::<_, i64>(0)) {
+        let _ = crate::embeddings::store(conn, "file", file_id, &filename);
+    }
+
     Ok(())
 }
 
 pub fn remove_file(conn: &Connection, path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
-    conn.execute("DELETE FROM files WHERE path = ?1", [path_str])
+    let id: Option<i64> = conn
+        .query_row("SELECT id FROM files WHERE path = ?1", [&path_str], |r| r.get(0))
+        .optional()
+        .context("looking up file id before delete")?;
+    conn.execute("DELETE FROM files WHERE path = ?1", [&path_str])
         .context("deleting file row")?;
+    if let Some(id) = id {
+        let _ = conn.execute("DELETE FROM embeddings WHERE object_type = 'file' AND object_id = ?1", [id]);
+    }
     Ok(())
 }
 
