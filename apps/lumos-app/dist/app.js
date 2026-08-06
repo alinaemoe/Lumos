@@ -248,23 +248,41 @@ async function confirmAddProject() {
 
 // ---- Scan progress (from add_project's background scan) ----
 
+// A folder with a few hundred files scans in well under a second — without
+// a floor here, "Scanning…" would flash and swap to "Indexed" before
+// anyone could actually read it, which is exactly what looked broken.
+const MIN_SCANNING_VISIBLE_MS = 700;
+const DONE_VISIBLE_MS = 3500;
+let scanStartedAtMs = 0;
+
 function showScanStatus(text, done) {
   clearTimeout(scanBarHideTimer);
   scanBarTextEl.textContent = text;
   scanBarEl.classList.add("visible");
   scanBarEl.classList.toggle("done", Boolean(done));
   if (done) {
-    scanBarHideTimer = setTimeout(() => scanBarEl.classList.remove("visible"), 2500);
+    scanBarHideTimer = setTimeout(() => scanBarEl.classList.remove("visible"), DONE_VISIBLE_MS);
   }
 }
 
 listen("scan-progress", (event) => {
   const { project, status, indexed } = event.payload;
   if (status === "started") {
+    scanStartedAtMs = performance.now();
     showScanStatus(`Scanning "${project}"…`, false);
-  } else {
+    return;
+  }
+
+  const showFinished = () => {
     const count = typeof indexed === "number" ? `${indexed} file${indexed === 1 ? "" : "s"}` : "files";
     showScanStatus(`✓ Indexed ${count} in "${project}"`, true);
+  };
+  const elapsed = performance.now() - scanStartedAtMs;
+  const remaining = MIN_SCANNING_VISIBLE_MS - elapsed;
+  if (remaining > 0) {
+    setTimeout(showFinished, remaining);
+  } else {
+    showFinished();
   }
 });
 
