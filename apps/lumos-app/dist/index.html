@@ -13,9 +13,11 @@
         <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
       </svg>
       <input id="query" type="text" placeholder="Search files…" autocomplete="off" spellcheck="false" />
+      <button id="clear-btn" title="Clear">✕</button>
       <button id="add-project-btn" title="Add project">+</button>
       <span id="hint">↵ open · ⌃↵ reveal · Esc</span>
     </div>
+    <div id="scan-status-bar"><div class="spinner"></div><span id="scan-status-text"></span></div>
     <div id="results"></div>
     <div id="drag-veil">
       <div class="drag-veil-inner">Drop folder to add as project</div>

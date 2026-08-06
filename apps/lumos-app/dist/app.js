@@ -1,14 +1,21 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+const shellEl = document.getElementById("shell");
 const queryEl = document.getElementById("query");
 const resultsEl = document.getElementById("results");
 const addProjectBtn = document.getElementById("add-project-btn");
 const dragVeilEl = document.getElementById("drag-veil");
+const searchIconEl = document.getElementById("search-icon");
+const clearBtn = document.getElementById("clear-btn");
+const scanBarEl = document.getElementById("scan-status-bar");
+const scanBarTextEl = document.getElementById("scan-status-text");
 
 let results = [];
 let selected = 0;
 let debounceTimer = null;
+let currentQuery = "";
+let scanBarHideTimer = null;
 
 // "search" | "add-project" — gates which keyboard/click handlers are live,
 // so opening the add-project panel can't accidentally "open" a stale search
@@ -42,6 +49,29 @@ function escapeHtml(s) {
   return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Wraps whichever query words appear in `text` with `.match` — built on the
+// already-escaped string so it can't reopen an HTML-escaping hole through
+// the query itself.
+function highlightText(text, query) {
+  const escaped = escapeHtml(text);
+  const terms = query
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((t) => escapeRegExp(escapeHtml(t)));
+  if (!terms.length) return escaped;
+  const pattern = new RegExp(`(${terms.join("|")})`, "ig");
+  return escaped.replace(pattern, '<span class="match">$1</span>');
+}
+
+function updateClearButton() {
+  clearBtn.classList.toggle("visible", queryEl.value.length > 0);
+}
+
 // Rebuilds the DOM — only when the result *set* changes (new search, or the
 // overlay was just reopened). Moving the selection must never call this: a
 // full innerHTML replace re-triggers every row's entrance animation at once,
@@ -65,8 +95,8 @@ function renderResults() {
         <div class="result ${i === selected ? "selected" : ""}" data-index="${i}">
           <div class="file-icon" style="background:${color}">${label}</div>
           <div class="result-text">
-            <div class="result-name">${escapeHtml(r.filename)}</div>
-            <div class="result-path">${escapeHtml(r.path)}</div>
+            <div class="result-name">${highlightText(r.filename, currentQuery)}</div>
+            <div class="result-path">${highlightText(r.path, currentQuery)}</div>
           </div>
           <div class="result-meta">
             ${project}
@@ -94,19 +124,33 @@ function scrollSelectedIntoView() {
 }
 
 async function runSearch(query) {
+  currentQuery = query;
   if (!query.trim()) {
     results = [];
     selected = 0;
     renderResults();
     return;
   }
+  searchIconEl.classList.add("searching");
   try {
     results = await invoke("search_files", { query });
     selected = 0;
     renderResults();
   } catch (e) {
     console.error("search failed", e);
+  } finally {
+    searchIconEl.classList.remove("searching");
   }
+}
+
+function clearSearch() {
+  queryEl.value = "";
+  currentQuery = "";
+  results = [];
+  selected = 0;
+  updateClearButton();
+  renderResults();
+  queryEl.focus();
 }
 
 // The Rust side handles whether the overlay hides or stays put — it drops
@@ -171,11 +215,7 @@ function leaveAddProjectMode() {
 
 function exitAddProjectMode() {
   leaveAddProjectMode();
-  queryEl.value = "";
-  results = [];
-  selected = 0;
-  renderResults();
-  queryEl.focus();
+  clearSearch();
 }
 
 async function pickFolder() {
@@ -206,6 +246,28 @@ async function confirmAddProject() {
   }
 }
 
+// ---- Scan progress (from add_project's background scan) ----
+
+function showScanStatus(text, done) {
+  clearTimeout(scanBarHideTimer);
+  scanBarTextEl.textContent = text;
+  scanBarEl.classList.add("visible");
+  scanBarEl.classList.toggle("done", Boolean(done));
+  if (done) {
+    scanBarHideTimer = setTimeout(() => scanBarEl.classList.remove("visible"), 2500);
+  }
+}
+
+listen("scan-progress", (event) => {
+  const { project, status, indexed } = event.payload;
+  if (status === "started") {
+    showScanStatus(`Scanning "${project}"…`, false);
+  } else {
+    const count = typeof indexed === "number" ? `${indexed} file${indexed === 1 ? "" : "s"}` : "files";
+    showScanStatus(`✓ Indexed ${count} in "${project}"`, true);
+  }
+});
+
 // ---- Input wiring ----
 
 // Touching the search box — clicking into it or typing — always means "I
@@ -222,10 +284,13 @@ queryEl.addEventListener("input", () => {
   if (mode === "add-project") {
     leaveAddProjectMode();
   }
+  updateClearButton();
   clearTimeout(debounceTimer);
   const q = queryEl.value;
   debounceTimer = setTimeout(() => runSearch(q), 120);
 });
+
+clearBtn.addEventListener("click", () => clearSearch());
 
 addProjectBtn.addEventListener("click", () => {
   if (mode === "add-project") {
@@ -263,7 +328,13 @@ document.addEventListener("keydown", (e) => {
     }
   } else if (e.key === "Escape") {
     e.preventDefault();
-    invoke("hide_overlay");
+    // First Escape clears an active query (instant-clear hotkey); only a
+    // second press — once there's nothing left to clear — hides Lumos.
+    if (queryEl.value.length > 0) {
+      clearSearch();
+    } else {
+      invoke("hide_overlay");
+    }
   } else if (e.key === "Enter") {
     e.preventDefault();
     activate(results[selected], e.ctrlKey ? "reveal" : "open");
@@ -332,10 +403,19 @@ if (dragDropSource?.onDragDropEvent) {
 }
 
 listen("overlay-shown", () => {
+  // Force a reflow between remove/add so rapid re-opens restart the CSS
+  // animation instead of a no-op (removing then re-adding the same class
+  // in one frame wouldn't otherwise retrigger it).
+  shellEl.classList.remove("entering");
+  void shellEl.offsetWidth;
+  shellEl.classList.add("entering");
+
   if (mode === "add-project") return; // preserve in-progress add flow across toggles
   queryEl.value = "";
+  currentQuery = "";
   results = [];
   selected = 0;
+  updateClearButton();
   renderResults();
   queryEl.focus();
 });
