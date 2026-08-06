@@ -385,12 +385,14 @@ function renderSuggestions() {
   if (!suggestions.length) {
     suggestionsEl.classList.remove("visible");
     suggestionsEl.innerHTML = "";
+    resultsEl.classList.remove("dimmed");
     return;
   }
   suggestionsEl.innerHTML = suggestions
     .map((s, i) => `<div class="suggestion ${i === 0 ? "active" : ""}" data-value="${escapeHtml(s)}">${escapeHtml(s)}</div>`)
     .join("");
   suggestionsEl.classList.add("visible");
+  resultsEl.classList.add("dimmed");
 }
 
 function updateSuggestionHighlight() {
@@ -403,6 +405,7 @@ function hideSuggestions() {
   suggestions = [];
   suggestionsEl.classList.remove("visible");
   suggestionsEl.innerHTML = "";
+  resultsEl.classList.remove("dimmed");
 }
 
 function acceptSuggestion(value) {
