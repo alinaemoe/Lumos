@@ -34,15 +34,37 @@ const EXT_STYLE = {
   txt: ["TXT", "#6b6b73"], sql: ["SQL", "#4a90a4"],
 };
 
+const CLIP_STYLE = {
+  json: ["{ }", "#8bc34a"], sql: ["SQL", "#4a90a4"], jwt: ["JWT", "#c46dd0"],
+  uuid: ["ID", "#5a5a63"], stacktrace: ["ERR", "#e8734a"], url: ["URL", "#5b9dd9"],
+  text: ["TXT", "#6b6b73"],
+};
+
 function iconFor(ext) {
   const key = (ext || "").toLowerCase();
   return EXT_STYLE[key] || [(key || "?").slice(0, 4).toUpperCase(), "#5a5a63"];
+}
+
+function clipIconFor(detectedType) {
+  return CLIP_STYLE[detectedType] || CLIP_STYLE.text;
 }
 
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatRelativeTime(unixSeconds) {
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+function clipboardPreview(text) {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function escapeHtml(s) {
@@ -89,6 +111,21 @@ function renderResults() {
 
   resultsEl.innerHTML = results
     .map((r, i) => {
+      if (r.kind === "clipboard") {
+        const [label, color] = clipIconFor(r.detected_type);
+        return `
+          <div class="result ${i === selected ? "selected" : ""}" data-index="${i}">
+            <div class="file-icon" style="background:${color}">${label}</div>
+            <div class="result-text">
+              <div class="result-name">${highlightText(clipboardPreview(r.text_content), currentQuery)}</div>
+              <div class="result-path">Clipboard · ${formatRelativeTime(r.created_at)}</div>
+            </div>
+            <div class="result-meta">
+              <span class="badge">${escapeHtml(r.detected_type)}</span>
+            </div>
+          </div>`;
+      }
+
       const [label, color] = iconFor(r.extension);
       const project = r.project_name ? `<span class="badge">${escapeHtml(r.project_name)}</span>` : "";
       return `
@@ -158,6 +195,11 @@ function clearSearch() {
 // (dialog cancelled) or moves on for good (file opened) before deciding.
 function activate(r, action) {
   if (!r) return;
+  if (r.kind === "clipboard") {
+    invoke("copy_to_clipboard", { text: r.text_content });
+    invoke("hide_overlay");
+    return;
+  }
   if (action === "reveal") {
     invoke("reveal_in_explorer", { path: r.path });
   } else {
