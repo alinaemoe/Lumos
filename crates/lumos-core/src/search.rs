@@ -1,5 +1,13 @@
+use crate::clipboard::ClipboardResult;
 use anyhow::Result;
 use rusqlite::Connection;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SearchHit {
+    File(SearchResult),
+    Clipboard(ClipboardResult),
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
@@ -15,7 +23,7 @@ pub struct SearchResult {
 /// "CheckoutItem.cs" throws a syntax error instead of just searching for it.
 /// Wrapping each word as an escaped quoted phrase forces FTS5 to treat it as
 /// literal text; juxtaposed quoted phrases default to AND between them.
-fn sanitize_fts_query(raw: &str) -> String {
+pub(crate) fn sanitize_fts_query(raw: &str) -> String {
     raw.split_whitespace()
         .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
         .collect::<Vec<_>>()
@@ -53,4 +61,24 @@ pub fn search(conn: &Connection, query: &str, limit: i64) -> Result<Vec<SearchRe
 
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Files and clipboard history live in one search box in the UI, so this is
+/// the one entry point the overlay actually calls — files first (the more
+/// mature, higher-signal source), then clipboard entries filling out the
+/// rest of the budget.
+pub fn search_all(conn: &Connection, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
+    let files = search(conn, query, limit)?;
+    let remaining = (limit - files.len() as i64).max(0);
+    let clips = if remaining > 0 {
+        crate::clipboard::search(conn, query, remaining)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(files
+        .into_iter()
+        .map(SearchHit::File)
+        .chain(clips.into_iter().map(SearchHit::Clipboard))
+        .collect())
 }

@@ -2267,8 +2267,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "notify",
+ "regex",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "toml 0.8.2",

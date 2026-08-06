@@ -51,6 +51,33 @@ CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
     INSERT INTO files_fts(files_fts, rowid, filename, path) VALUES('delete', old.id, old.filename, old.path);
     INSERT INTO files_fts(rowid, filename, path) VALUES (new.id, new.filename, new.path);
 END;
+
+CREATE TABLE IF NOT EXISTS clipboard_entries (
+    id INTEGER PRIMARY KEY,
+    content_type TEXT NOT NULL DEFAULT 'text',
+    text_content TEXT,
+    detected_type TEXT,
+    project_id INTEGER REFERENCES projects(id),
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clipboard_created ON clipboard_entries(created_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS clipboard_fts USING fts5(
+    text_content, content='clipboard_entries', content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS clipboard_ai AFTER INSERT ON clipboard_entries BEGIN
+    INSERT INTO clipboard_fts(rowid, text_content) VALUES (new.id, new.text_content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS clipboard_ad AFTER DELETE ON clipboard_entries BEGIN
+    INSERT INTO clipboard_fts(clipboard_fts, rowid, text_content) VALUES('delete', old.id, old.text_content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS clipboard_au AFTER UPDATE ON clipboard_entries BEGIN
+    INSERT INTO clipboard_fts(clipboard_fts, rowid, text_content) VALUES('delete', old.id, old.text_content);
+    INSERT INTO clipboard_fts(rowid, text_content) VALUES (new.id, new.text_content);
+END;
 "#;
 
 pub fn open(db_path: &Path) -> Result<Connection> {
