@@ -53,8 +53,15 @@ enum ClipboardAction {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
-    /// FTS5 search over clipboard history.
+    /// FTS5 search over clipboard history. Supports `type:xxx`, `today`,
+    /// `yesterday`, `week` filter tokens mixed in with free text.
     Search { query: String },
+    /// Pin an entry so retention cleanup never deletes it.
+    Pin { id: i64 },
+    /// Unpin an entry.
+    Unpin { id: i64 },
+    /// Delete unpinned entries older than N days.
+    Purge { days: i64 },
 }
 
 #[derive(Subcommand)]
@@ -136,7 +143,7 @@ fn run_watch(conn: &Connection, paths: Vec<PathBuf>) -> Result<()> {
 }
 
 fn run_search(conn: &Connection, query: &str) -> Result<()> {
-    let results = search::search(conn, query, 20)?;
+    let results = search::search(conn, query, None, 20)?;
     if results.is_empty() {
         println!("no matches for {query:?}");
         return Ok(());
@@ -151,12 +158,14 @@ fn run_search(conn: &Connection, query: &str) -> Result<()> {
 fn print_clip(c: &clipboard::ClipboardResult) {
     let preview: String = c.text_content.chars().take(80).collect();
     let preview = preview.replace('\n', "⏎");
-    println!("[{}] #{} {}: {}", c.created_at, c.id, c.detected_type, preview);
+    let pin = if c.pinned { "📌" } else { "  " };
+    let source = c.source_app.as_deref().unwrap_or("-");
+    println!("{pin}[{}] #{} {} ({source}): {}", c.created_at, c.id, c.detected_type, preview);
 }
 
 fn run_clipboard(conn: &Connection, action: ClipboardAction) -> Result<()> {
     match action {
-        ClipboardAction::Record { text } => match clipboard::record_text(conn, &text)? {
+        ClipboardAction::Record { text } => match clipboard::record_text(conn, &text, None)? {
             Some(id) => println!("recorded #{id} (type: {})", clipboard::classify(&text)),
             None => println!("skipped (empty or duplicate of last entry)"),
         },
@@ -170,13 +179,26 @@ fn run_clipboard(conn: &Connection, action: ClipboardAction) -> Result<()> {
             }
         }
         ClipboardAction::Search { query } => {
-            let entries = clipboard::search(conn, &query, 20)?;
+            let (text, filters) = search::parse_filters(&query);
+            let entries = clipboard::search(conn, &text, &filters, 20)?;
             if entries.is_empty() {
                 println!("no matches for {query:?}");
             }
             for c in entries {
                 print_clip(&c);
             }
+        }
+        ClipboardAction::Pin { id } => {
+            clipboard::set_pinned(conn, id, true)?;
+            println!("pinned #{id}");
+        }
+        ClipboardAction::Unpin { id } => {
+            clipboard::set_pinned(conn, id, false)?;
+            println!("unpinned #{id}");
+        }
+        ClipboardAction::Purge { days } => {
+            let removed = clipboard::purge_older_than(conn, days)?;
+            println!("removed {removed} entr{} older than {days} day(s)", if removed == 1 { "y" } else { "ies" });
         }
     }
     Ok(())
