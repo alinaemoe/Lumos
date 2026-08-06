@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS clipboard_entries (
     text_content TEXT,
     detected_type TEXT,
     search_extra TEXT,
+    source_app TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0,
     project_id INTEGER REFERENCES projects(id),
     created_at INTEGER NOT NULL
 );
@@ -120,6 +122,28 @@ fn migrate_clipboard_search_extra(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `source_app` and `pinned` were added alongside `search_extra` but need
+/// no FTS rebuild — they're plain columns, not indexed content — so a
+/// simple guarded `ALTER TABLE` per column is enough.
+fn migrate_clipboard_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        ("source_app", "ALTER TABLE clipboard_entries ADD COLUMN source_app TEXT"),
+        (
+            "pinned",
+            "ALTER TABLE clipboard_entries ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        let has_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('clipboard_entries') WHERE name = ?1")?
+            .exists([column])?;
+        if !has_column {
+            conn.execute(ddl, [])
+                .with_context(|| format!("adding clipboard_entries.{column}"))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn open(db_path: &Path) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -129,6 +153,7 @@ pub fn open(db_path: &Path) -> Result<Connection> {
         .with_context(|| format!("opening database at {:?}", db_path))?;
     conn.execute_batch(SCHEMA).context("running schema migration")?;
     migrate_clipboard_search_extra(&conn)?;
+    migrate_clipboard_columns(&conn)?;
     Ok(conn)
 }
 
