@@ -346,6 +346,17 @@ fn row_to_result(row: &rusqlite::Row) -> rusqlite::Result<ClipboardResult> {
     })
 }
 
+pub fn by_id(conn: &Connection, id: i64) -> Result<Option<ClipboardResult>> {
+    conn.query_row(
+        "SELECT id, text_content, detected_type, source_app, pinned, created_at
+         FROM clipboard_entries WHERE id = ?1",
+        [id],
+        row_to_result,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Optional filters extracted from a `type:xxx` / `today` / `yesterday` /
 /// `week` query prefix — see `search::parse_filters`. Kept here (rather
 /// than making callers build SQL themselves) so the WHERE-clause wiring

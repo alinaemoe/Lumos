@@ -81,6 +81,17 @@ CREATE TRIGGER IF NOT EXISTS clipboard_au AFTER UPDATE ON clipboard_entries BEGI
     INSERT INTO clipboard_fts(clipboard_fts, rowid, text_content, search_extra) VALUES('delete', old.id, old.text_content, old.search_extra);
     INSERT INTO clipboard_fts(rowid, text_content, search_extra) VALUES (new.id, new.text_content, new.search_extra);
 END;
+
+-- One row per (object_type, object_id) — 'file' -> files.id, 'clipboard' ->
+-- clipboard_entries.id. No FTS table: these are looked up by brute-force
+-- cosine scan in Rust, not matched via SQL text search. See embeddings.rs
+-- for why sqlite-vec isn't used at this data scale.
+CREATE TABLE IF NOT EXISTS embeddings (
+    object_type TEXT NOT NULL,
+    object_id INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    PRIMARY KEY (object_type, object_id)
+);
 "#;
 
 /// `search_extra` (type name + synonyms + decoded JWT payload, etc.) was

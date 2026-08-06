@@ -1,6 +1,8 @@
 use crate::clipboard::{self, ClipboardResult, Filters};
+use crate::embeddings;
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -12,6 +14,7 @@ pub enum SearchHit {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
+    pub id: i64,
     pub path: String,
     pub filename: String,
     pub extension: Option<String>,
@@ -80,7 +83,7 @@ pub fn search(conn: &Connection, query: &str, since: Option<i64>, limit: i64) ->
     }
 
     let mut sql = String::from(
-        "SELECT f.path, f.filename, f.extension, f.size, p.name
+        "SELECT f.id, f.path, f.filename, f.extension, f.size, p.name
          FROM files f
          LEFT JOIN projects p ON p.id = f.project_id",
     );
@@ -111,11 +114,12 @@ pub fn search(conn: &Connection, query: &str, since: Option<i64>, limit: i64) ->
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt.query_map(param_refs.as_slice(), |row| {
         Ok(SearchResult {
-            path: row.get(0)?,
-            filename: row.get(1)?,
-            extension: row.get(2)?,
-            size: row.get(3)?,
-            project_name: row.get(4)?,
+            id: row.get(0)?,
+            path: row.get(1)?,
+            filename: row.get(2)?,
+            extension: row.get(3)?,
+            size: row.get(4)?,
+            project_name: row.get(5)?,
         })
     })?;
 
@@ -123,30 +127,84 @@ pub fn search(conn: &Connection, query: &str, since: Option<i64>, limit: i64) ->
         .map_err(Into::into)
 }
 
+fn file_by_id(conn: &Connection, id: i64) -> Result<Option<SearchResult>> {
+    conn.query_row(
+        "SELECT f.id, f.path, f.filename, f.extension, f.size, p.name
+         FROM files f LEFT JOIN projects p ON p.id = f.project_id
+         WHERE f.id = ?1",
+        [id],
+        |row| {
+            Ok(SearchResult {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                filename: row.get(2)?,
+                extension: row.get(3)?,
+                size: row.get(4)?,
+                project_name: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Files and clipboard history live in one search box in the UI, so this is
-/// the one entry point the overlay actually calls — files first (the more
-/// mature, higher-signal source), then clipboard entries filling out the
-/// rest of the budget. `type:xxx` is clipboard-only (files don't have a
-/// detected_type) and skips the files search entirely — searching "type:jwt"
-/// for filenames would just be confusing.
+/// the one entry point the overlay actually calls. Exact-token FTS5 matches
+/// come first (higher precision, and free — no model needed), then
+/// semantic matches fill out the rest of the budget so "ошибка базы" can
+/// still surface "cannot connect to database" even though they share zero
+/// literal tokens. `type:xxx` is clipboard-only (files don't have a
+/// detected_type) and skips both files search and files' semantic pass —
+/// searching "type:jwt" for filenames would just be confusing.
 pub fn search_all(conn: &Connection, raw_query: &str, limit: i64) -> Result<Vec<SearchHit>> {
     let (text, filters) = parse_filters(raw_query);
+    let want_files = filters.detected_type.is_none();
 
-    let files = if filters.detected_type.is_none() {
+    let files = if want_files {
         search(conn, &text, filters.since, limit)?
     } else {
         Vec::new()
     };
+    let mut seen_file_ids: HashSet<i64> = files.iter().map(|f| f.id).collect();
+
     let remaining = (limit - files.len() as i64).max(0);
     let clips = if remaining > 0 {
         clipboard::search(conn, &text, &filters, remaining)?
     } else {
         Vec::new()
     };
+    let mut seen_clip_ids: HashSet<i64> = clips.iter().map(|c| c.id).collect();
 
-    Ok(files
+    let mut hits: Vec<SearchHit> = files
         .into_iter()
         .map(SearchHit::File)
         .chain(clips.into_iter().map(SearchHit::Clipboard))
-        .collect())
+        .collect();
+
+    if !text.trim().is_empty() {
+        if want_files {
+            let budget = (limit - hits.len() as i64).max(0) as usize;
+            if budget > 0 {
+                for (id, _score) in embeddings::search(conn, "file", &text, budget)? {
+                    if seen_file_ids.insert(id) {
+                        if let Some(r) = file_by_id(conn, id)? {
+                            hits.push(SearchHit::File(r));
+                        }
+                    }
+                }
+            }
+        }
+        let budget = (limit - hits.len() as i64).max(0) as usize;
+        if budget > 0 {
+            for (id, _score) in embeddings::search(conn, "clipboard", &text, budget)? {
+                if seen_clip_ids.insert(id) {
+                    if let Some(c) = clipboard::by_id(conn, id)? {
+                        hits.push(SearchHit::Clipboard(c));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(hits)
 }

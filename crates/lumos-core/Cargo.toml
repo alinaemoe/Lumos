@@ -15,3 +15,13 @@ notify = "6"
 regex = "1"
 serde_json = "1"
 base64 = "0.22"
+ort = "2.0.0-rc.13"
+# default-features off to drop `esaxx_fast` (Unigram/SentencePiece tokenizer
+# support) — our BERT/WordPiece tokenizer.json never uses it, and its C++
+# dependency (esaxx-rs) links against a different CRT than ort's prebuilt
+# ONNX Runtime binaries, which is a hard link error (LNK2038) when both are
+# in the same binary.
+tokenizers = { version = "0.20", default-features = false, features = ["onig", "progressbar"] }
+ndarray = "0.17"
+ureq = "2"
+log = "0.4"
