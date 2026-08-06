@@ -296,6 +296,26 @@ pub fn run() {
             app.manage(DbState(Arc::new(Mutex::new(conn))));
             app.manage(SuppressBlurHide(AtomicBool::new(false)));
 
+            // Semantic search backfill: catches up anything embedded
+            // before this feature existed (or from a run where the model
+            // hadn't finished downloading yet). New files/clipboard entries
+            // are embedded inline as they're created — this thread is only
+            // for the backlog, so it runs once and exits. First run over
+            // an existing history downloads the ~118MB model; if there's
+            // no network, `backfill_all` just no-ops and FTS keeps working.
+            std::thread::spawn(|| {
+                let Ok(conn) = lumos_core::db::open(&lumos_core::db::default_db_path()) else {
+                    return;
+                };
+                match lumos_core::embeddings::backfill_all(&conn) {
+                    Ok((files, clips)) if files > 0 || clips > 0 => {
+                        log::info!("semantic search backfill: embedded {files} file(s), {clips} clipboard entries");
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("semantic search backfill failed: {e}"),
+                }
+            });
+
             #[cfg(windows)]
             if let Err(e) = autostart::ensure_enabled() {
                 log::warn!("failed to register autostart: {e}");
