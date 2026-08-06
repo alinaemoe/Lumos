@@ -28,6 +28,12 @@ fn copy_to_clipboard(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn toggle_pin(state: tauri::State<DbState>, id: i64, pinned: bool) -> Result<(), String> {
+    let conn = state.0.lock().map_err(|e| e.to_string())?;
+    lumos_core::clipboard::set_pinned(&conn, id, pinned).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn hide_overlay(app: tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("overlay") {
         let _ = w.hide();
@@ -277,6 +283,16 @@ pub fn run() {
             }
 
             let conn = db::open(&db::default_db_path())?;
+            // Retention: unpinned clipboard entries older than this just
+            // accumulate forever otherwise. Run once per launch — cheap,
+            // and there's no long-running process to schedule it from
+            // between launches anyway.
+            const CLIPBOARD_RETENTION_DAYS: i64 = 90;
+            match lumos_core::clipboard::purge_older_than(&conn, CLIPBOARD_RETENTION_DAYS) {
+                Ok(removed) if removed > 0 => log::info!("clipboard retention: purged {removed} entries older than {CLIPBOARD_RETENTION_DAYS} days"),
+                Ok(_) => {}
+                Err(e) => log::warn!("clipboard retention purge failed: {e}"),
+            }
             app.manage(DbState(Arc::new(Mutex::new(conn))));
             app.manage(SuppressBlurHide(AtomicBool::new(false)));
 
@@ -323,7 +339,8 @@ pub fn run() {
             reveal_in_explorer,
             pick_folder,
             add_project,
-            copy_to_clipboard
+            copy_to_clipboard,
+            toggle_pin
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
