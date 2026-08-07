@@ -21,12 +21,13 @@
 //! activate — FTS5 keeps working on its own, per the "works without an
 //! LLM/network" principle the rest of Lumos already follows.
 
+use crate::object::{ObjectId, ObjectType};
+use crate::storage::EmbeddingStore;
 use anyhow::{Context, Result};
 use ndarray::Axis;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
-use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tokenizers::{PaddingParams, Tokenizer};
@@ -210,44 +211,18 @@ pub fn is_available() -> bool {
     embedder().is_some()
 }
 
-fn vector_to_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
+// Vector <-> byte encoding used to live here; it moved to the SQLite store
+// in Phase 2. How a vector is serialized is a storage concern — this module
+// now only ever sees `&[f32]`.
 
-fn bytes_to_vector(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-/// Embeds and stores `text` under `(object_type, object_id)`, replacing
-/// any existing vector for that key. No-op (returns `Ok(())`) if the model
-/// isn't available — callers don't need their own fallback branch.
-pub fn store(conn: &Connection, object_type: &str, object_id: i64, text: &str) -> Result<()> {
+/// Embeds and stores `text` for `id`, replacing any existing vector.
+/// No-op (returns `Ok(())`) if the model isn't available — callers don't
+/// need their own fallback branch.
+pub fn store(store: &impl EmbeddingStore, id: ObjectId, text: &str) -> Result<()> {
     let Some(embedder) = embedder() else { return Ok(()) };
     let vectors = embedder.embed(&[text], false)?;
     let Some(vector) = vectors.into_iter().next() else { return Ok(()) };
-
-    conn.execute(
-        "INSERT INTO embeddings (object_type, object_id, vector) VALUES (?1, ?2, ?3)
-         ON CONFLICT(object_type, object_id) DO UPDATE SET vector = excluded.vector",
-        rusqlite::params![object_type, object_id, vector_to_bytes(&vector)],
-    )
-    .context("storing embedding")?;
-    Ok(())
-}
-
-/// Object ids of `object_type` that don't have an embedding yet — the
-/// backfill command's work list.
-pub fn missing(conn: &Connection, object_type: &str, table: &str) -> Result<Vec<i64>> {
-    let sql = format!(
-        "SELECT t.id FROM {table} t
-         LEFT JOIN embeddings e ON e.object_type = ?1 AND e.object_id = t.id
-         WHERE e.object_id IS NULL"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([object_type], |row| row.get(0))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    store.put_vector(id, &vector)
 }
 
 /// Catches up anything that slipped through — a row inserted while the
@@ -255,38 +230,39 @@ pub fn missing(conn: &Connection, object_type: &str, table: &str) -> Result<Vec<
 /// existed, whatever. Both the CLI (`lumos embed`) and the app's own
 /// startup pass call this; it's the one place that work is defined.
 /// Returns `(files_embedded, clipboard_entries_embedded)`.
-pub fn backfill_all(conn: &Connection) -> Result<(usize, usize)> {
+pub fn backfill_all(st: &impl EmbeddingStore) -> Result<(usize, usize)> {
     if !is_available() {
         return Ok((0, 0));
     }
 
-    let file_ids = missing(conn, "file", "files")?;
-    for id in &file_ids {
-        let filename: Option<String> = conn
-            .query_row("SELECT filename FROM files WHERE id = ?1", [id], |r| r.get(0))
-            .optional()?;
-        if let Some(filename) = filename {
-            store(conn, "file", *id, &filename)?;
+    let mut counts = [0usize; 2];
+    for (slot, object_type) in [ObjectType::File, ObjectType::Clipboard].into_iter().enumerate() {
+        let ids = st.ids_missing_vectors(object_type)?;
+        for local_id in &ids {
+            let id = ObjectId::new(object_type, *local_id);
+            if let Some(text) = st.embeddable_text(id)? {
+                store(st, id, &text)?;
+            }
         }
+        counts[slot] = ids.len();
     }
 
-    let clip_ids = missing(conn, "clipboard", "clipboard_entries")?;
-    for id in &clip_ids {
-        let text: Option<String> = conn
-            .query_row("SELECT text_content FROM clipboard_entries WHERE id = ?1", [id], |r| r.get(0))
-            .optional()?;
-        if let Some(text) = text {
-            store(conn, "clipboard", *id, &text)?;
-        }
-    }
-
-    Ok((file_ids.len(), clip_ids.len()))
+    Ok((counts[0], counts[1]))
 }
 
 /// Brute-force cosine search (vectors are pre-normalized, so this is just a
 /// dot product) — see the module doc for why this beats sqlite-vec at this
 /// scale. Returns `(object_id, score)` sorted best-first.
-pub fn search(conn: &Connection, object_type: &str, query: &str, limit: usize) -> Result<Vec<(i64, f32)>> {
+///
+/// Storage supplies the vectors; the scoring, sorting and cutoff are domain
+/// rules and stay here. Swapping the brute-force scan for an ANN index is
+/// therefore a change to `load_vectors`, not to this function's callers.
+pub fn search(
+    st: &impl EmbeddingStore,
+    object_type: ObjectType,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(i64, f32)>> {
     let Some(embedder) = embedder() else { return Ok(Vec::new()) };
     let query_vec = embedder
         .embed(&[query], true)?
@@ -297,15 +273,10 @@ pub fn search(conn: &Connection, object_type: &str, query: &str, limit: usize) -
         return Ok(Vec::new());
     }
 
-    let mut stmt = conn.prepare("SELECT object_id, vector FROM embeddings WHERE object_type = ?1")?;
-    let rows = stmt.query_map([object_type], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-
-    let mut scored: Vec<(i64, f32)> = rows
-        .filter_map(|r| r.ok())
-        .map(|(id, bytes)| {
-            let v = bytes_to_vector(&bytes);
+    let mut scored: Vec<(i64, f32)> = st
+        .load_vectors(object_type)?
+        .into_iter()
+        .map(|(id, v)| {
             let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
             (id, score)
         })

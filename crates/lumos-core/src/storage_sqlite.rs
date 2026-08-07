@@ -177,7 +177,9 @@ impl ClipboardStore for SqliteStore<'_> {
     fn latest_text(&self) -> Result<Option<String>> {
         self.conn
             .query_row(
-                "SELECT text_content FROM clipboard_entries ORDER BY id DESC LIMIT 1",
+                "SELECT text_content FROM clipboard_entries
+                 WHERE content_type = 'text'
+                 ORDER BY id DESC LIMIT 1",
                 [],
                 |r| r.get::<_, Option<String>>(0),
             )

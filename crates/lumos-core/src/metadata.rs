@@ -1,7 +1,6 @@
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use crate::storage::ProjectStore;
+use anyhow::Result;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Marker files checked in a project root to guess the kind of repo it is.
 /// Order matters: more specific markers are checked before generic ones.
@@ -36,34 +35,9 @@ pub fn detect_repo_type(root: &Path) -> Option<String> {
     None
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 /// Creates the project if it doesn't exist yet, returns its id.
-pub fn get_or_create_project(conn: &Connection, name: &str) -> Result<i64> {
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM projects WHERE name = ?1",
-            [name],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("looking up project by name")?;
-
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-
-    conn.execute(
-        "INSERT INTO projects (name, created_at) VALUES (?1, ?2)",
-        rusqlite::params![name, now()],
-    )
-    .context("inserting project")?;
-    Ok(conn.last_insert_rowid())
+pub fn get_or_create_project(store: &impl ProjectStore, name: &str) -> Result<i64> {
+    store.get_or_create_project(name)
 }
 
 /// Canonicalizes a path for stable comparisons. On Windows,
@@ -81,40 +55,70 @@ fn normalize_path(path: &Path) -> String {
 /// from marker files unless one is already known. This is the one place a
 /// human-provided project name meets the filesystem — everything downstream
 /// (files, sessions, clipboard) resolves its project through this table.
-pub fn register_project_path(conn: &Connection, project_id: i64, path: &Path) -> Result<()> {
+pub fn register_project_path(
+    store: &impl ProjectStore,
+    project_id: i64,
+    path: &Path,
+) -> Result<()> {
     let path_str = normalize_path(path);
     let repo_type = detect_repo_type(path);
-
-    conn.execute(
-        "INSERT INTO project_paths (project_id, path, repo_type)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(path) DO UPDATE SET project_id = excluded.project_id, repo_type = excluded.repo_type",
-        rusqlite::params![project_id, path_str, repo_type],
-    )
-    .context("registering project path")?;
-    Ok(())
+    store.register_project_path(project_id, &path_str, repo_type.as_deref())
 }
 
 /// Finds which project owns a given file path by matching against all
 /// registered project_paths and picking the longest (most specific) prefix.
-pub fn resolve_project_for_path(conn: &Connection, file_path: &Path) -> Result<Option<i64>> {
+///
+/// The storage layer only supplies the candidate list — the choice of
+/// *which* path wins is a domain rule, so it lives here and is testable
+/// without a database (see `pick_longest_prefix`).
+pub fn resolve_project_for_path(
+    store: &impl ProjectStore,
+    file_path: &Path,
+) -> Result<Option<i64>> {
     let file_path_str = normalize_path(file_path);
+    let candidates = store.list_project_paths()?;
+    Ok(pick_longest_prefix(&file_path_str, &candidates))
+}
 
-    let mut stmt = conn.prepare("SELECT project_id, path FROM project_paths")?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
+/// Longest-prefix match: the most specific registered root wins, so a
+/// repo nested inside another registered folder claims its own files.
+pub(crate) fn pick_longest_prefix(
+    file_path: &str,
+    candidates: &[crate::storage::ProjectPathEntry],
+) -> Option<i64> {
     let mut best: Option<(i64, usize)> = None;
-    for (project_id, root) in rows {
-        if file_path_str.starts_with(&root) {
-            let len = root.len();
+    for entry in candidates {
+        if file_path.starts_with(&entry.path) {
+            let len = entry.path.len();
             if best.map(|(_, best_len)| len > best_len).unwrap_or(true) {
-                best = Some((project_id, len));
+                best = Some((entry.project_id, len));
             }
         }
     }
-    Ok(best.map(|(id, _)| id))
+    best.map(|(id, _)| id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::ProjectPathEntry;
+
+    fn entry(project_id: i64, path: &str) -> ProjectPathEntry {
+        ProjectPathEntry { project_id, path: path.into() }
+    }
+
+    #[test]
+    fn most_specific_registered_root_wins() {
+        let candidates = vec![
+            entry(1, "C:\\work"),
+            entry(2, "C:\\work\\lumos"),
+            entry(3, "C:\\other"),
+        ];
+        assert_eq!(
+            pick_longest_prefix("C:\\work\\lumos\\src\\main.rs", &candidates),
+            Some(2)
+        );
+        assert_eq!(pick_longest_prefix("C:\\work\\notes.md", &candidates), Some(1));
+        assert_eq!(pick_longest_prefix("D:\\elsewhere\\x", &candidates), None);
+    }
 }
