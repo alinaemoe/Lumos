@@ -2,7 +2,7 @@
 //!
 //! Pure domain layer: no `rusqlite`, no filesystem APIs, no Tauri, no UI.
 //! Every current and future data source (File, Clipboard, Screenshot,
-//! Browser, Session, Email) is representable as an `Object`. Nothing in
+//! BrowserVisit, Session, Email) is representable as an `Object`. Nothing in
 //! this module knows how an `Object` is stored or how it was produced —
 //! that's the job of Phase 2 (storage boundary) and Phase 3 (ingestion
 //! pipeline), respectively. This phase only introduces the vocabulary.
@@ -17,7 +17,7 @@ pub enum ObjectType {
     File,
     Clipboard,
     Screenshot,
-    Browser,
+    BrowserVisit,
     Session,
     Email,
 }
@@ -67,6 +67,10 @@ pub struct FilePayload {
     pub filename: String,
     pub extension: Option<String>,
     pub size: i64,
+    /// Content hash. `None` both for files too large to hash and for
+    /// conversions from sources that don't carry it (see the `SearchResult`
+    /// adapter, whose query doesn't select this column).
+    pub hash: Option<String>,
     pub project_name: Option<String>,
 }
 
@@ -87,9 +91,9 @@ pub struct ClipboardPayload {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScreenshotPayload {}
 
-/// Placeholder — no Browser pipeline exists yet.
+/// Placeholder — no browser-history pipeline exists yet.
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct BrowserPayload {}
+pub struct BrowserVisitPayload {}
 
 /// Placeholder — no Session pipeline exists yet.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -109,7 +113,7 @@ pub enum ObjectPayload {
     File(FilePayload),
     Clipboard(ClipboardPayload),
     Screenshot(ScreenshotPayload),
-    Browser(BrowserPayload),
+    BrowserVisit(BrowserVisitPayload),
     Session(SessionPayload),
     Email(EmailPayload),
 }
@@ -120,7 +124,7 @@ impl ObjectPayload {
             ObjectPayload::File(_) => ObjectType::File,
             ObjectPayload::Clipboard(_) => ObjectType::Clipboard,
             ObjectPayload::Screenshot(_) => ObjectType::Screenshot,
-            ObjectPayload::Browser(_) => ObjectType::Browser,
+            ObjectPayload::BrowserVisit(_) => ObjectType::BrowserVisit,
             ObjectPayload::Session(_) => ObjectType::Session,
             ObjectPayload::Email(_) => ObjectType::Email,
         }

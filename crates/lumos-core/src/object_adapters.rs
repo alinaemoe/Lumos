@@ -11,8 +11,43 @@
 //! existing call site is wired to them yet.
 
 use crate::clipboard::ClipboardResult;
+use crate::models::FileRecord;
 use crate::object::{ClipboardPayload, FilePayload, Object, ObjectMetadata, ObjectPayload};
 use crate::search::SearchResult;
+
+/// `FileRecord` → `Object`.
+///
+/// Not a `From` impl, because `FileRecord` carries no identity of its own —
+/// it models the *columns* of a file row, not the row itself, so the caller
+/// has to supply the storage-assigned id. Making this a `From` would force
+/// a fabricated id (0, or an `Option` nobody checks), which is exactly the
+/// kind of quiet lie this model exists to prevent.
+///
+/// This is the richest of the three adapters: unlike `SearchResult`,
+/// `FileRecord` actually carries `project_id`, `created_at`, `modified_at`
+/// and `hash`, so the resulting `ObjectMetadata` is fully populated.
+pub fn file_record_to_object(id: i64, r: &FileRecord) -> Object {
+    Object::new(
+        id,
+        ObjectMetadata {
+            created_at: Some(r.created_at),
+            updated_at: Some(r.modified_at),
+            project_id: r.project_id,
+            source: None,
+        },
+        ObjectPayload::File(FilePayload {
+            path: r.path.clone(),
+            filename: r.filename.clone(),
+            extension: r.extension.clone(),
+            size: r.size,
+            hash: r.hash.clone(),
+            // FileRecord stores the project by id, not by name — resolving
+            // it to a display name is a storage-layer join, not something
+            // an adapter should invent.
+            project_name: None,
+        }),
+    )
+}
 
 impl From<&SearchResult> for Object {
     /// `search::SearchResult` doesn't project `created_at`/`modified_at`
@@ -29,6 +64,7 @@ impl From<&SearchResult> for Object {
                 filename: r.filename.clone(),
                 extension: r.extension.clone(),
                 size: r.size,
+                hash: None,
                 project_name: r.project_name.clone(),
             }),
         )
@@ -90,6 +126,35 @@ mod tests {
             ObjectPayload::File(f) => {
                 assert_eq!(f.filename, "main.rs");
                 assert_eq!(f.project_name, Some("Lumos".into()));
+            }
+            _ => panic!("expected File payload"),
+        }
+    }
+
+    #[test]
+    fn file_record_maps_to_object_with_full_metadata() {
+        let r = FileRecord {
+            path: "C:\\proj\\lib.rs".into(),
+            filename: "lib.rs".into(),
+            extension: Some("rs".into()),
+            size: 2048,
+            hash: Some("abc123".into()),
+            file_type: None,
+            project_id: Some(3),
+            created_at: 1_700_000_000,
+            modified_at: 1_700_000_500,
+        };
+        let obj = file_record_to_object(99, &r);
+        assert_eq!(obj.id.object_type, ObjectType::File);
+        assert_eq!(obj.id.local_id, 99);
+        // Unlike the SearchResult adapter, this one has real metadata to map.
+        assert_eq!(obj.metadata.created_at, Some(1_700_000_000));
+        assert_eq!(obj.metadata.updated_at, Some(1_700_000_500));
+        assert_eq!(obj.metadata.project_id, Some(3));
+        match obj.payload {
+            ObjectPayload::File(f) => {
+                assert_eq!(f.hash, Some("abc123".into()));
+                assert_eq!(f.project_name, None);
             }
             _ => panic!("expected File payload"),
         }
