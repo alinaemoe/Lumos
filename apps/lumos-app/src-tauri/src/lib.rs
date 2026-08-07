@@ -3,6 +3,7 @@ mod clipboard_watcher;
 mod hotkey;
 
 use lumos_core::{db, search::SearchHit};
+use lumos_core::storage_sqlite::SqliteStore;
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -222,8 +223,8 @@ fn add_project(
     {
         let conn = state.0.lock().map_err(|e| e.to_string())?;
         let project_id =
-            lumos_core::metadata::get_or_create_project(&conn, &name).map_err(|e| e.to_string())?;
-        lumos_core::metadata::register_project_path(&conn, project_id, &root)
+            lumos_core::metadata::get_or_create_project(&SqliteStore::new(&conn), &name).map_err(|e| e.to_string())?;
+        lumos_core::metadata::register_project_path(&SqliteStore::new(&conn), project_id, &root)
             .map_err(|e| e.to_string())?;
     }
 
@@ -239,7 +240,7 @@ fn add_project(
     std::thread::spawn(move || {
         let indexed = lumos_core::db::open(&lumos_core::db::default_db_path())
             .ok()
-            .and_then(|conn| lumos_core::scan::scan_path(&conn, &root).ok())
+            .and_then(|conn| lumos_core::scan::scan_path(&SqliteStore::new(&conn), &root).ok())
             .map(|stats| stats.indexed);
 
         let _ = app.emit(
@@ -307,7 +308,7 @@ pub fn run() {
                 let Ok(conn) = lumos_core::db::open(&lumos_core::db::default_db_path()) else {
                     return;
                 };
-                match lumos_core::embeddings::backfill_all(&conn) {
+                match lumos_core::embeddings::backfill_all(&SqliteStore::new(&conn)) {
                     Ok((files, clips)) if files > 0 || clips > 0 => {
                         log::info!("semantic search backfill: embedded {files} file(s), {clips} clipboard entries");
                     }

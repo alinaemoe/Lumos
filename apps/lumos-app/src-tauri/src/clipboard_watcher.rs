@@ -93,7 +93,11 @@ pub fn spawn() {
             };
 
             let source_app = foreground_app_name();
-            if let Err(e) = lumos_core::clipboard::record_text(&conn, &text, source_app.as_deref())
+            if let Err(e) = lumos_core::clipboard::record_text(
+                &lumos_core::storage_sqlite::SqliteStore::new(&conn),
+                &text,
+                source_app.as_deref(),
+            )
             {
                 log::warn!("clipboard watcher: failed to record entry: {e}");
             }

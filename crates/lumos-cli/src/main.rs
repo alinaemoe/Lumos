@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use lumos_core::storage_sqlite::SqliteStore;
 use lumos_core::{clipboard, db, embeddings, metadata, scan, search, watcher};
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -102,8 +103,9 @@ fn main() -> Result<()> {
 fn run_project(conn: &Connection, action: ProjectAction) -> Result<()> {
     match action {
         ProjectAction::Add { name, path } => {
-            let project_id = metadata::get_or_create_project(conn, &name)?;
-            metadata::register_project_path(conn, project_id, &path)?;
+            let store = SqliteStore::new(conn);
+            let project_id = metadata::get_or_create_project(&store, &name)?;
+            metadata::register_project_path(&store, project_id, &path)?;
             println!("registered {:?} under project '{name}' (id {project_id})", path);
         }
         ProjectAction::List => {
@@ -131,7 +133,7 @@ fn run_project(conn: &Connection, action: ProjectAction) -> Result<()> {
 
 fn run_scan(conn: &Connection, path: &PathBuf) -> Result<()> {
     println!("scanning {:?}...", path);
-    let stats = scan::scan_path(conn, path)?;
+    let stats = scan::scan_path(&SqliteStore::new(conn), path)?;
     println!("indexed {} file(s), {} error(s)", stats.indexed, stats.errors);
     Ok(())
 }
@@ -150,7 +152,7 @@ fn run_watch(conn: &Connection, paths: Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    watcher::watch_and_index(conn, &roots)
+    watcher::watch_and_index(&SqliteStore::new(conn), &roots)
 }
 
 fn run_search(conn: &Connection, query: &str) -> Result<()> {
@@ -194,7 +196,7 @@ fn print_clip(c: &clipboard::ClipboardResult) {
 
 fn run_clipboard(conn: &Connection, action: ClipboardAction) -> Result<()> {
     match action {
-        ClipboardAction::Record { text } => match clipboard::record_text(conn, &text, None)? {
+        ClipboardAction::Record { text } => match clipboard::record_text(&SqliteStore::new(conn), &text, None)? {
             Some(id) => println!("recorded #{id} (type: {})", clipboard::classify(&text)),
             None => println!("skipped (empty or duplicate of last entry)"),
         },
@@ -238,7 +240,7 @@ fn run_embed(conn: &Connection) -> Result<()> {
         println!("embedding model unavailable (no network on first run, or it failed to load) — semantic search stays off, FTS keeps working");
         return Ok(());
     }
-    let (files, clips) = embeddings::backfill_all(conn)?;
+    let (files, clips) = embeddings::backfill_all(&SqliteStore::new(conn))?;
     println!("embedded {files} file(s), {clips} clipboard entr{}", if clips == 1 { "y" } else { "ies" });
     Ok(())
 }
