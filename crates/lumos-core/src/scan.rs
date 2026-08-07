@@ -1,6 +1,6 @@
 use crate::indexer::index_file;
+use crate::storage::{EmbeddingStore, FileStore, ProjectStore};
 use anyhow::Result;
-use rusqlite::Connection;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -25,7 +25,10 @@ pub struct ScanStats {
     pub errors: u64,
 }
 
-pub fn scan_path(conn: &Connection, root: &Path) -> Result<ScanStats> {
+pub fn scan_path<S>(store: &S, root: &Path) -> Result<ScanStats>
+where
+    S: FileStore + ProjectStore + EmbeddingStore,
+{
     let mut stats = ScanStats::default();
 
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
@@ -47,7 +50,7 @@ pub fn scan_path(conn: &Connection, root: &Path) -> Result<ScanStats> {
         if !entry.file_type().is_file() {
             continue;
         }
-        match index_file(conn, entry.path()) {
+        match index_file(store, entry.path()) {
             Ok(()) => stats.indexed += 1,
             Err(_) => stats.errors += 1,
         }
