@@ -1,5 +1,5 @@
 use crate::indexer::index_file;
-use crate::storage::{EmbeddingStore, FileStore, ProjectStore};
+use crate::storage::{EmbeddingStore, ObjectStore, ProjectStore};
 use anyhow::Result;
 use std::path::Path;
 use walkdir::WalkDir;
@@ -27,7 +27,7 @@ pub struct ScanStats {
 
 pub fn scan_path<S>(store: &S, root: &Path) -> Result<ScanStats>
 where
-    S: FileStore + ProjectStore + EmbeddingStore,
+    S: ObjectStore + ProjectStore + EmbeddingStore,
 {
     let mut stats = ScanStats::default();
 

@@ -237,14 +237,13 @@ pub fn backfill_all(st: &impl EmbeddingStore) -> Result<(usize, usize)> {
 
     let mut counts = [0usize; 2];
     for (slot, object_type) in [ObjectType::File, ObjectType::Clipboard].into_iter().enumerate() {
-        let ids = st.ids_missing_vectors(object_type)?;
-        for local_id in &ids {
-            let id = ObjectId::new(object_type, *local_id);
-            if let Some(text) = st.embeddable_text(id)? {
-                store(st, id, &text)?;
-            }
+        // One query returns ids *and* their text, instead of a lookup per
+        // row as the pre-2.1 version did.
+        let pending = st.pending_embeddings(object_type, usize::MAX)?;
+        for (id, text) in &pending {
+            store(st, *id, text)?;
         }
-        counts[slot] = ids.len();
+        counts[slot] = pending.len();
     }
 
     Ok((counts[0], counts[1]))
@@ -254,9 +253,12 @@ pub fn backfill_all(st: &impl EmbeddingStore) -> Result<(usize, usize)> {
 /// dot product) — see the module doc for why this beats sqlite-vec at this
 /// scale. Returns `(object_id, score)` sorted best-first.
 ///
-/// Storage supplies the vectors; the scoring, sorting and cutoff are domain
-/// rules and stay here. Swapping the brute-force scan for an ANN index is
-/// therefore a change to `load_vectors`, not to this function's callers.
+/// This module owns turning text into a vector; finding the nearest stored
+/// vectors is an index operation and lives behind `EmbeddingStore::nearest`
+/// — the same side of the boundary as an FTS `MATCH`. That split is what
+/// lets the brute-force scan be swapped for an ANN index without any caller
+/// noticing. (Phase 2 had it the other way round and would have had to move
+/// this code anyway.)
 pub fn search(
     st: &impl EmbeddingStore,
     object_type: ObjectType,
@@ -273,17 +275,6 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    let mut scored: Vec<(i64, f32)> = st
-        .load_vectors(object_type)?
-        .into_iter()
-        .map(|(id, v)| {
-            let score: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-            (id, score)
-        })
-        .collect();
-
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored.truncate(limit);
-    Ok(scored)
+    st.nearest(object_type, &query_vec, limit)
 }
 

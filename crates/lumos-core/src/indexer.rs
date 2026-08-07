@@ -1,6 +1,6 @@
 use crate::metadata::resolve_project_for_path;
-use crate::object::{ObjectId, ObjectType};
-use crate::storage::{EmbeddingStore, FileStore, FileUpsert, ProjectStore};
+use crate::object::{FilePayload, ObjectMetadata, ObjectPayload, ObjectType};
+use crate::storage::{EmbeddingStore, NewObject, ObjectStore, ProjectStore};
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -48,7 +48,7 @@ fn to_epoch_secs(t: std::io::Result<std::time::SystemTime>) -> i64 {
 /// project, and stores an embedding. Nothing about SQLite appears in it.
 pub fn index_file<S>(store: &S, path: &Path) -> Result<()>
 where
-    S: FileStore + ProjectStore + EmbeddingStore,
+    S: ObjectStore + ProjectStore + EmbeddingStore,
 {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
@@ -69,43 +69,56 @@ where
     let hash = hash_file(path, size);
     let project_id = resolve_project_for_path(store, path)?;
 
-    let record = FileUpsert {
-        path: path.to_string_lossy().to_string(),
-        filename: filename.clone(),
-        extension,
-        size: size as i64,
-        hash,
-        project_id,
-        created_at: to_epoch_secs(meta.created()),
-        modified_at: to_epoch_secs(meta.modified()),
-    };
-    let file_id = store.upsert_file(&record)?;
+    // One object, one `save` — the pipeline never names a table or picks
+    // between insert and update. Storage owns that.
+    let object = NewObject::new(
+        ObjectMetadata {
+            created_at: Some(to_epoch_secs(meta.created())),
+            updated_at: Some(to_epoch_secs(meta.modified())),
+            project_id,
+            source: None,
+        },
+        ObjectPayload::File(FilePayload {
+            path: path.to_string_lossy().to_string(),
+            filename: filename.clone(),
+            extension,
+            size: size as i64,
+            hash,
+            // Write-side objects don't carry the project's display name —
+            // that's a read-side join. See the adapter note in object.rs.
+            project_name: None,
+        }),
+    );
+    let id = store.save(&object)?;
 
     // Best-effort — a filename embedding is small and quick (one short
     // sequence through a small CPU model), and `store` itself no-ops
     // silently if the model never loaded. Failures here shouldn't fail
     // indexing over what's genuinely a search-quality nicety.
-    let _ = crate::embeddings::store(store, ObjectId::new(ObjectType::File, file_id), &filename);
+    let _ = crate::embeddings::store(store, id, &filename);
 
     Ok(())
 }
 
+/// Generic in shape: resolve a natural key to an identity, then delete
+/// that identity. Nothing here is file-specific except which
+/// `ObjectType` is named — deleting a screenshot or an email will be the
+/// same two calls. Derived data (embeddings) is removed inside
+/// `ObjectStore::delete`, so no caller has to remember §10.2.
 pub fn remove_file<S>(store: &S, path: &Path) -> Result<()>
 where
-    S: FileStore + EmbeddingStore,
+    S: ObjectStore,
 {
     let path_str = path.to_string_lossy().to_string();
-    // Derived data dies with the object it was derived from —
-    // `ARCHITECTURE_INVARIANTS.md` §10.2.
-    if let Some(id) = store.remove_file_by_path(&path_str)? {
-        let _ = store.remove_vector(ObjectId::new(ObjectType::File, id));
+    if let Some(id) = store.resolve(ObjectType::File, &path_str)? {
+        store.delete(id)?;
     }
     Ok(())
 }
 
 pub fn rename_file<S>(store: &S, from: &Path, to: &Path) -> Result<()>
 where
-    S: FileStore + ProjectStore + EmbeddingStore,
+    S: ObjectStore + ProjectStore + EmbeddingStore,
 {
     remove_file(store, from)?;
     index_file(store, to)

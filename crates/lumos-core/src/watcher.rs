@@ -1,5 +1,5 @@
 use crate::indexer;
-use crate::storage::{EmbeddingStore, FileStore, ProjectStore};
+use crate::storage::{EmbeddingStore, ObjectStore, ProjectStore};
 use anyhow::{Context, Result};
 use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -15,7 +15,7 @@ use std::sync::mpsc::channel;
 /// mechanism, far less surface area to get wrong solo.
 pub fn watch_and_index<S>(store: &S, roots: &[PathBuf]) -> Result<()>
 where
-    S: FileStore + ProjectStore + EmbeddingStore,
+    S: ObjectStore + ProjectStore + EmbeddingStore,
 {
     let (tx, rx) = channel::<notify::Result<Event>>();
 
@@ -43,7 +43,7 @@ where
 
 fn handle_event<S>(store: &S, event: &Event)
 where
-    S: FileStore + ProjectStore + EmbeddingStore,
+    S: ObjectStore + ProjectStore + EmbeddingStore,
 {
     match &event.kind {
         EventKind::Create(_) => {

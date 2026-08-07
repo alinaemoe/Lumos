@@ -1,6 +1,6 @@
-use crate::object::{ObjectId, ObjectType};
+use crate::object::{ClipboardPayload, ObjectMetadata, ObjectPayload, ObjectType};
 use crate::search::sanitize_fts_query;
-use crate::storage::{ClipboardInsert, ClipboardStore, EmbeddingStore};
+use crate::storage::{EmbeddingStore, NewObject, ObjectStore};
 use anyhow::{Context, Result};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
@@ -306,7 +306,7 @@ pub fn classify(text: &str) -> &'static str {
 /// nothing was recorded.
 pub fn record_text<S>(store: &S, text: &str, source_app: Option<&str>) -> Result<Option<i64>>
 where
-    S: ClipboardStore + EmbeddingStore,
+    S: ObjectStore + EmbeddingStore,
 {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -316,24 +316,32 @@ where
 
     // The duplicate *decision* is a domain rule; storage only supplies the
     // text to compare against.
-    if store.latest_text()?.as_deref() == Some(capped) {
+    if store.latest_text(ObjectType::Clipboard)?.as_deref() == Some(capped) {
         return Ok(None);
     }
 
     let detected = classify(capped);
-    let id = store.insert_entry(&ClipboardInsert {
-        text: capped.to_string(),
-        detected_type: detected.to_string(),
-        search_extra: build_search_extra(detected, capped),
-        source_app: source_app.map(str::to_string),
-        created_at: now(),
-    })?;
+    let object = NewObject::new(
+        ObjectMetadata {
+            created_at: Some(now()),
+            updated_at: None,
+            project_id: None,
+            source: source_app.map(str::to_string),
+        },
+        ObjectPayload::Clipboard(ClipboardPayload {
+            text_content: capped.to_string(),
+            detected_type: detected.to_string(),
+            pinned: false,
+            search_extra: Some(build_search_extra(detected, capped)),
+        }),
+    );
+    let id = store.save(&object)?;
 
     // Best-effort, same reasoning as the file indexer: a missed/failed
     // embedding degrades semantic search quietly, not clipboard recording.
-    let _ = crate::embeddings::store(store, ObjectId::new(ObjectType::Clipboard, id), capped);
+    let _ = crate::embeddings::store(store, id, capped);
 
-    Ok(Some(id))
+    Ok(Some(id.local_id))
 }
 
 fn row_to_result(row: &rusqlite::Row) -> rusqlite::Result<ClipboardResult> {
