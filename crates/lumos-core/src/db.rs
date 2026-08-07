@@ -168,6 +168,14 @@ pub fn open(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// An empty database with the real schema, held in memory. For tests that
+/// need to exercise storage behaviour without touching disk.
+pub fn open_in_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory().context("opening in-memory database")?;
+    conn.execute_batch(SCHEMA).context("running schema migration")?;
+    Ok(conn)
+}
+
 pub fn default_db_path() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)

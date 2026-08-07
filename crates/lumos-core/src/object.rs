@@ -81,6 +81,13 @@ pub struct ClipboardPayload {
     pub text_content: String,
     pub detected_type: String,
     pub pinned: bool,
+    /// Extra text folded into the search index alongside the content —
+    /// type synonyms, a decoded JWT payload. Domain-computed (see
+    /// `clipboard::build_search_extra`), so it is present when saving and
+    /// `None` when an object was reconstructed from a read that didn't
+    /// project it. Phase 4 will likely generalise this into an
+    /// object-level "indexable text" field once other sources need one.
+    pub search_extra: Option<String>,
 }
 
 /// Placeholder — no Screenshot pipeline exists yet (see

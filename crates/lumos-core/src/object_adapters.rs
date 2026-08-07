@@ -93,6 +93,10 @@ impl From<&ClipboardResult> for Object {
                 text_content: c.text_content.clone(),
                 detected_type: c.detected_type.clone(),
                 pinned: c.pinned,
+                // `ClipboardResult` comes from a read that doesn't project
+                // `search_extra`, so it is genuinely unknown here — not
+                // empty. Same honesty rule as the file adapter's metadata.
+                search_extra: None,
             }),
         )
     }
