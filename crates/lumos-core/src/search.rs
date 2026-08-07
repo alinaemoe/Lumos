@@ -1,5 +1,7 @@
 use crate::clipboard::{self, ClipboardResult, Filters};
 use crate::embeddings;
+use crate::object::ObjectType;
+use crate::storage_sqlite::SqliteStore;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
@@ -185,7 +187,7 @@ pub fn search_all(conn: &Connection, raw_query: &str, limit: i64) -> Result<Vec<
         if want_files {
             let budget = (limit - hits.len() as i64).max(0) as usize;
             if budget > 0 {
-                for (id, _score) in embeddings::search(conn, "file", &text, budget)? {
+                for (id, _score) in embeddings::search(&SqliteStore::new(conn), ObjectType::File, &text, budget)? {
                     if seen_file_ids.insert(id) {
                         if let Some(r) = file_by_id(conn, id)? {
                             hits.push(SearchHit::File(r));
@@ -196,7 +198,7 @@ pub fn search_all(conn: &Connection, raw_query: &str, limit: i64) -> Result<Vec<
         }
         let budget = (limit - hits.len() as i64).max(0) as usize;
         if budget > 0 {
-            for (id, _score) in embeddings::search(conn, "clipboard", &text, budget)? {
+            for (id, _score) in embeddings::search(&SqliteStore::new(conn), ObjectType::Clipboard, &text, budget)? {
                 if seen_clip_ids.insert(id) {
                     if let Some(c) = clipboard::by_id(conn, id)? {
                         hits.push(SearchHit::Clipboard(c));

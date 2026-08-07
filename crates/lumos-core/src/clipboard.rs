@@ -1,4 +1,6 @@
+use crate::object::{ObjectId, ObjectType};
 use crate::search::sanitize_fts_query;
+use crate::storage::{ClipboardInsert, ClipboardStore, EmbeddingStore};
 use anyhow::{Context, Result};
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
@@ -302,40 +304,34 @@ pub fn classify(text: &str) -> &'static str {
 /// `None` if unavailable) — this crate stays OS-agnostic and never queries
 /// the foreground window itself. Returns the new row id, or `None` if
 /// nothing was recorded.
-pub fn record_text(conn: &Connection, text: &str, source_app: Option<&str>) -> Result<Option<i64>> {
+pub fn record_text<S>(store: &S, text: &str, source_app: Option<&str>) -> Result<Option<i64>>
+where
+    S: ClipboardStore + EmbeddingStore,
+{
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(None);
     }
     let capped = truncate_utf8(trimmed, MAX_TEXT_BYTES);
 
-    let last: Option<String> = conn
-        .query_row(
-            "SELECT text_content FROM clipboard_entries
-             WHERE content_type = 'text'
-             ORDER BY id DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("checking last clipboard entry")?;
-    if last.as_deref() == Some(capped) {
+    // The duplicate *decision* is a domain rule; storage only supplies the
+    // text to compare against.
+    if store.latest_text()?.as_deref() == Some(capped) {
         return Ok(None);
     }
 
     let detected = classify(capped);
-    let search_extra = build_search_extra(detected, capped);
-    conn.execute(
-        "INSERT INTO clipboard_entries (content_type, text_content, detected_type, search_extra, source_app, created_at)
-         VALUES ('text', ?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![capped, detected, search_extra, source_app, now()],
-    )
-    .context("inserting clipboard entry")?;
+    let id = store.insert_entry(&ClipboardInsert {
+        text: capped.to_string(),
+        detected_type: detected.to_string(),
+        search_extra: build_search_extra(detected, capped),
+        source_app: source_app.map(str::to_string),
+        created_at: now(),
+    })?;
 
-    let id = conn.last_insert_rowid();
     // Best-effort, same reasoning as the file indexer: a missed/failed
     // embedding degrades semantic search quietly, not clipboard recording.
-    let _ = crate::embeddings::store(conn, "clipboard", id, capped);
+    let _ = crate::embeddings::store(store, ObjectId::new(ObjectType::Clipboard, id), capped);
 
     Ok(Some(id))
 }
