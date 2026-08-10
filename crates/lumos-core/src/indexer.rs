@@ -149,13 +149,13 @@ mod tests {
 
         index_file(&store, &file_path).expect("indexing must succeed");
 
-        let hits = crate::search::search(&conn, "hydration_notes", None, 10).unwrap();
+        let hits = crate::search::search(&store, "hydration_notes", None, 10).unwrap();
         assert_eq!(hits.len(), 1, "the file must be findable through FTS after indexing");
         assert_eq!(hits[0].filename, "hydration_notes.rs");
 
         // Cascade delete: remove_file -> ObjectStore::delete -> row + FTS gone.
         remove_file(&store, &file_path).unwrap();
-        let hits_after = crate::search::search(&conn, "hydration_notes", None, 10).unwrap();
+        let hits_after = crate::search::search(&store, "hydration_notes", None, 10).unwrap();
         assert!(hits_after.is_empty(), "deleted files must not remain searchable");
 
         let _ = std::fs::remove_dir_all(&dir);

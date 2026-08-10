@@ -4,7 +4,7 @@ use crate::search::sanitize_fts_query;
 use crate::storage::{EmbeddingStore, NewObject, ObjectStore};
 use anyhow::{Context, Result};
 use regex::Regex;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -359,17 +359,6 @@ fn row_to_result(row: &rusqlite::Row) -> rusqlite::Result<ClipboardResult> {
         pinned: row.get::<_, i64>(4)? != 0,
         created_at: row.get(5)?,
     })
-}
-
-pub fn by_id(conn: &Connection, id: i64) -> Result<Option<ClipboardResult>> {
-    conn.query_row(
-        "SELECT id, text_content, detected_type, source_app, pinned, created_at
-         FROM clipboard_entries WHERE id = ?1",
-        [id],
-        row_to_result,
-    )
-    .optional()
-    .map_err(Into::into)
 }
 
 /// Optional filters extracted from a `type:xxx` / `today` / `yesterday` /
