@@ -41,7 +41,7 @@
 //! storage today. Every operation on a type with no backing returns an
 //! **error** — never an empty result. See [`ObjectStore::supported_types`].
 
-use crate::object::{ObjectId, ObjectMetadata, ObjectPayload, ObjectType};
+use crate::object::{Object, ObjectId, ObjectMetadata, ObjectPayload, ObjectType};
 use anyhow::Result;
 
 /// An object that hasn't been persisted yet, and therefore has no
@@ -124,6 +124,59 @@ pub trait ObjectStore {
     /// "did this just repeat?" check applies to browser visits and any
     /// other stream of near-duplicate events.
     fn latest_text(&self, object_type: ObjectType) -> Result<Option<String>>;
+
+    /// Loads full objects by identity — the hydration step Search needs to
+    /// turn an `EmbeddingStore::nearest`/`FullTextIndex::search_text` hit
+    /// (a bare id) back into something with content and metadata.
+    ///
+    /// Added as prework for Phase 4 (Generic Search); nothing calls it yet
+    /// — `search.rs` still hydrates via its own `file_by_id`/
+    /// `clipboard::by_id` queries. Those are expected to be replaced by
+    /// this method when the generic engine is actually built, not in this
+    /// pass.
+    ///
+    /// Ids belonging to an unsupported type make the whole call fail
+    /// (consistent with every other `ObjectStore` method) — but an id of a
+    /// *supported* type that no longer exists (deleted between the index
+    /// lookup and this call) is silently omitted from the result, not an
+    /// error. A caller cannot distinguish "never existed" from "existed
+    /// and was just deleted," and for hydration purposes it doesn't need
+    /// to — either way there is nothing to show.
+    ///
+    /// Implementations must batch internally (one query per distinct
+    /// `ObjectType` present in `ids`, not one query per id) — this is the
+    /// operation a naive per-source `by_id` N+1 pattern was replaced for.
+    fn load(&self, ids: &[ObjectId]) -> Result<Vec<Object>>;
+}
+
+/// Full-text candidate lookup — storage's side of FTS, the textual sibling
+/// of [`EmbeddingStore::nearest`]. Storage decides *how* candidates are
+/// found (SQLite FTS5 today, something else later); the domain decides
+/// what to do with them once found (merge, rank, dedup — none of that is
+/// implemented yet; see `ARCHITECTURE_INVARIANTS.md` §4).
+///
+/// Deliberately not folded into [`ObjectStore`]: a caller that only writes
+/// or only does semantic search should not have to name this trait, the
+/// same reasoning that keeps [`EmbeddingStore`] separate.
+///
+/// This does not yet replace `search.rs`'s own hand-written FTS queries —
+/// those still exist, unchanged, alongside this trait. Wiring them together
+/// is Phase 4's job; this trait only makes the capability reachable without
+/// SQL outside `storage_sqlite.rs`.
+pub trait FullTextIndex {
+    /// FTS candidates for `query` within a single object type, best match
+    /// first, paired with a relevance score where **higher is better** —
+    /// the same convention `EmbeddingStore::nearest` uses for cosine
+    /// similarity. (SQLite FTS5's native `rank` is the opposite — smaller
+    /// is more relevant — so the implementation negates it before
+    /// returning; see `storage_sqlite.rs`.)
+    ///
+    /// That shared convention does *not* mean the two scores are on the
+    /// same scale — bm25-derived relevance and cosine similarity are not
+    /// comparable magnitudes, only comparable in *direction*. Fusing them
+    /// into one ranking (RRF or otherwise) is explicitly Phase 4's
+    /// decision, not something this trait resolves.
+    fn search_text(&self, object_type: ObjectType, query: &str, limit: usize) -> Result<Vec<(i64, f32)>>;
 }
 
 pub trait ProjectStore {

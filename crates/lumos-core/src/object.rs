@@ -11,6 +11,19 @@ use serde::Serialize;
 
 /// Which kind of source produced an object. New sources add a variant here
 /// — nothing else in this module changes shape as a result.
+///
+/// **Not the same concept as [`ClipboardPayload::detected_type`].** This
+/// enum answers "where did this come from" (File vs. Clipboard vs.
+/// Screenshot...). `detected_type` answers "what kind of content is this,
+/// within a single source" (a clipboard entry might be `"jwt"`, `"sql"`,
+/// `"url"`...) — it has no relationship to this enum at all and never will;
+/// a file is never a `"jwt"` and a clipboard entry is never a `File`. The
+/// two happen to share the word "type" in casual conversation and in the
+/// `type:xxx` query filter syntax (which filters on `detected_type`, not
+/// on `ObjectType`), which is the one place this is worth being pedantic
+/// about: a future `SearchIntent` that wants to filter by *source*
+/// (`object_types: Vec<ObjectType>`) needs a field distinct from whatever
+/// carries `type:jwt`-style filtering, not a reuse of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectType {
@@ -79,6 +92,11 @@ pub struct FilePayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClipboardPayload {
     pub text_content: String,
+    /// Content classification within the clipboard source — `"jwt"`,
+    /// `"sql"`, `"url"`, etc. (see `clipboard::classify`). Unrelated to
+    /// [`ObjectType`] — see the note on that enum. Files have no
+    /// equivalent field today; a generic content-taxonomy would be a
+    /// different, larger design question than this comment is scoping.
     pub detected_type: String,
     pub pinned: bool,
     /// Extra text folded into the search index alongside the content —

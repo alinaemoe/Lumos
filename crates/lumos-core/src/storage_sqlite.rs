@@ -11,12 +11,15 @@
 //! open their own, and this phase deliberately doesn't disturb any of that.
 //! Constructing one is free — it's a newtype over a reference.
 
-use crate::object::{ObjectId, ObjectMetadata, ObjectPayload, ObjectType};
+use crate::object::{
+    ClipboardPayload, FilePayload, Object, ObjectId, ObjectMetadata, ObjectPayload, ObjectType,
+};
 use crate::storage::{
-    EmbeddingStore, NewObject, ObjectStore, ProjectPathEntry, ProjectStore,
+    EmbeddingStore, FullTextIndex, NewObject, ObjectStore, ProjectPathEntry, ProjectStore,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
 
 /// Object types this store can persist. Everything else errors rather than
 /// returning empty — see `unsupported`.
@@ -77,6 +80,22 @@ fn unsupported(t: ObjectType) -> anyhow::Error {
         t,
         SUPPORTED
     )
+}
+
+/// FTS5 syntax escaping. A near-duplicate of `search::sanitize_fts_query`,
+/// kept local on purpose: this is an FTS5-syntax detail (which characters
+/// need escaping in a `MATCH` expression), not domain logic, and having
+/// `storage_sqlite.rs` — the infrastructure layer — reach *up* into
+/// `search.rs` to borrow it would invert the one dependency direction this
+/// module exists to enforce. Five lines of duplication is cheaper than that
+/// inversion. If this drifts out of sync with `search.rs`'s copy, that's a
+/// sign both should move to a shared low-level (non-domain) text-escaping
+/// module — not a reason to import across the boundary today.
+fn sanitize_fts_query(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn vector_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -161,6 +180,80 @@ impl SqliteStore<'_> {
         ))
     }
 
+    /// Batched load of files by id — one query for the whole set, not one
+    /// per id. Selects every column `ObjectMetadata`/`FilePayload` can
+    /// carry, including `created_at`/`modified_at`/`project_id`, which
+    /// `search::SearchResult` (a separate, older read path) does not
+    /// project. This is what makes those fields reachable for future
+    /// ranking without touching the schema.
+    fn load_files(&self, ids: &[i64]) -> Result<Vec<Object>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        // `placeholders` is built from `ids.len()` only, never from
+        // caller-supplied text — no injection surface.
+        let sql = format!(
+            "SELECT f.id, f.path, f.filename, f.extension, f.size, f.hash,
+                    f.project_id, f.created_at, f.modified_at, p.name
+             FROM files f LEFT JOIN projects p ON p.id = f.project_id
+             WHERE f.id IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok(Object::new(
+                row.get::<_, i64>(0)?,
+                ObjectMetadata {
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    project_id: row.get(6)?,
+                    source: None,
+                },
+                ObjectPayload::File(FilePayload {
+                    path: row.get(1)?,
+                    filename: row.get(2)?,
+                    extension: row.get(3)?,
+                    size: row.get(4)?,
+                    hash: row.get(5)?,
+                    project_name: row.get(9)?,
+                }),
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Batched load of clipboard entries by id — same reasoning as
+    /// `load_files`.
+    fn load_clipboard(&self, ids: &[i64]) -> Result<Vec<Object>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, text_content, detected_type, search_extra, source_app, pinned, created_at
+             FROM clipboard_entries WHERE id IN ({placeholders})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok(Object::new(
+                row.get::<_, i64>(0)?,
+                ObjectMetadata {
+                    created_at: row.get(6)?,
+                    updated_at: None,
+                    project_id: None,
+                    source: row.get(4)?,
+                },
+                ObjectPayload::Clipboard(ClipboardPayload {
+                    text_content: row.get(1)?,
+                    detected_type: row.get(2)?,
+                    pinned: row.get::<_, i64>(5)? != 0,
+                    search_extra: row.get(3)?,
+                }),
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Removes anything derived from an object. Called from `delete` so no
     /// caller has to remember it.
     fn remove_derived(&self, id: ObjectId) -> Result<()> {
@@ -243,6 +336,23 @@ impl ObjectStore for SqliteStore<'_> {
             ObjectType::File => Ok(None), // files aren't an event stream; nothing to dedupe
             t => Err(unsupported(t)),
         }
+    }
+
+    fn load(&self, ids: &[ObjectId]) -> Result<Vec<Object>> {
+        let mut by_type: HashMap<ObjectType, Vec<i64>> = HashMap::new();
+        for id in ids {
+            by_type.entry(id.object_type).or_default().push(id.local_id);
+        }
+
+        let mut out = Vec::with_capacity(ids.len());
+        for (object_type, local_ids) in by_type {
+            match object_type {
+                ObjectType::File => out.extend(self.load_files(&local_ids)?),
+                ObjectType::Clipboard => out.extend(self.load_clipboard(&local_ids)?),
+                t => return Err(unsupported(t)),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -383,6 +493,42 @@ impl EmbeddingStore for SqliteStore<'_> {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+}
+
+impl FullTextIndex for SqliteStore<'_> {
+    /// Queries the FTS5 virtual table directly (`SELECT rowid, rank FROM
+    /// <fts_table> WHERE <fts_table> MATCH ?`) rather than joining back to
+    /// `files`/`clipboard_entries` — this trait returns bare ids and
+    /// scores, the same shape as `EmbeddingStore::nearest`, so there is
+    /// nothing else to select. Hydrating those ids into full objects is
+    /// `ObjectStore::load`'s job, not this one's.
+    ///
+    /// FTS5's own `rank` is smaller-is-better; negated here so the return
+    /// value matches `nearest`'s higher-is-better convention (see the
+    /// trait doc — this is a sign-convention alignment only, *not* a scale
+    /// alignment).
+    fn search_text(&self, object_type: ObjectType, query: &str, limit: usize) -> Result<Vec<(i64, f32)>> {
+        let fts_table = match object_type {
+            ObjectType::File => "files_fts",
+            ObjectType::Clipboard => "clipboard_fts",
+            t => return Err(unsupported(t)),
+        };
+        let fts_query = sanitize_fts_query(query);
+        if fts_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // `fts_table` is a compile-time constant from the match above.
+        let sql = format!(
+            "SELECT rowid, rank FROM {fts_table} WHERE {fts_table} MATCH ?1 ORDER BY rank LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        rows.map(|r| r.map(|(id, rank)| (id, -(rank as f32))).map_err(anyhow::Error::from))
+            .collect()
     }
 }
 
@@ -531,5 +677,102 @@ mod tests {
 
         let capped = st.nearest(ObjectType::Clipboard, &[0.9, 0.1], 1).unwrap();
         assert_eq!(capped.len(), 1, "limit is honoured");
+    }
+
+    #[test]
+    fn load_returns_full_file_metadata_not_projected_by_search_rs() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let project_id = st.get_or_create_project("demo").unwrap();
+        let mut object = file_object("C:/p/main.rs");
+        object.metadata.project_id = Some(project_id);
+        let id = st.save(&object).unwrap();
+
+        let loaded = st.load(&[id]).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].metadata.created_at, Some(100));
+        assert_eq!(loaded[0].metadata.updated_at, Some(200));
+        assert_eq!(
+            loaded[0].metadata.project_id,
+            Some(project_id),
+            "created_at/updated_at/project_id must be reachable via load(), unlike search::SearchResult"
+        );
+    }
+
+    #[test]
+    fn load_returns_clipboard_object() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let id = st.save(&clip_object("SELECT 1")).unwrap();
+
+        let loaded = st.load(&[id]).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, id);
+        match &loaded[0].payload {
+            ObjectPayload::Clipboard(c) => assert_eq!(c.text_content, "SELECT 1"),
+            _ => panic!("expected Clipboard payload"),
+        }
+    }
+
+    #[test]
+    fn load_batches_mixed_types_in_one_call_and_skips_missing_ids() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let file_id = st.save(&file_object("C:/p/main.rs")).unwrap();
+        let clip_id = st.save(&clip_object("SELECT 1")).unwrap();
+        let ghost = ObjectId::new(ObjectType::File, 999_999);
+
+        let loaded = st.load(&[file_id, clip_id, ghost]).unwrap();
+        assert_eq!(loaded.len(), 2, "a missing id is omitted, not an error");
+        let ids: std::collections::HashSet<_> = loaded.iter().map(|o| o.id).collect();
+        assert!(ids.contains(&file_id));
+        assert!(ids.contains(&clip_id));
+    }
+
+    #[test]
+    fn load_of_empty_slice_is_empty_and_unsupported_type_errors() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        assert!(st.load(&[]).unwrap().is_empty());
+        assert!(st.load(&[ObjectId::new(ObjectType::Screenshot, 1)]).is_err());
+    }
+
+    #[test]
+    fn search_text_finds_file_and_clipboard_candidates() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let file_id = st.save(&file_object("C:/p/hydration_notes.rs")).unwrap();
+        let clip_id = st.save(&clip_object("hydration failed in react")).unwrap();
+
+        let file_hits = st.search_text(ObjectType::File, "hydration_notes", 10).unwrap();
+        assert_eq!(file_hits.len(), 1);
+        assert_eq!(file_hits[0].0, file_id.local_id);
+
+        let clip_hits = st.search_text(ObjectType::Clipboard, "hydration", 10).unwrap();
+        assert_eq!(clip_hits.len(), 1);
+        assert_eq!(clip_hits[0].0, clip_id.local_id);
+    }
+
+    #[test]
+    fn search_text_ranks_more_relevant_match_first() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        // "react" appears once in b, three times in a — a should rank higher.
+        let a = st.save(&clip_object("react react react error")).unwrap();
+        let b = st.save(&clip_object("a single react mention")).unwrap();
+
+        let hits = st.search_text(ObjectType::Clipboard, "react", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, a.local_id, "more relevant match must rank first");
+        assert_eq!(hits[1].0, b.local_id);
+        assert!(hits[0].1 > hits[1].1, "higher score must mean more relevant, matching nearest()'s convention");
+    }
+
+    #[test]
+    fn search_text_empty_query_and_unsupported_type() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        assert!(st.search_text(ObjectType::File, "   ", 10).unwrap().is_empty());
+        assert!(st.search_text(ObjectType::Screenshot, "x", 10).is_err());
     }
 }
