@@ -338,6 +338,30 @@ impl ObjectStore for SqliteStore<'_> {
         }
     }
 
+    /// File recency is `modified_at`; clipboard recency is insertion order
+    /// (`id DESC`), not `created_at DESC` — these are not the same thing
+    /// (a clock change could desync them) but `id DESC` is what
+    /// `clipboard::search`'s pre-Phase-4 no-text branch always used, and
+    /// this method exists specifically to preserve that behavior exactly,
+    /// not to improve on it.
+    fn recent(&self, object_type: ObjectType, since: i64, limit: usize) -> Result<Vec<ObjectId>> {
+        let (table, order_by, since_column) = match object_type {
+            ObjectType::File => ("files", "modified_at DESC", "modified_at"),
+            ObjectType::Clipboard => ("clipboard_entries", "id DESC", "created_at"),
+            t => return Err(unsupported(t)),
+        };
+        // All three are compile-time constants from the match above.
+        let sql = format!(
+            "SELECT id FROM {table} WHERE {since_column} >= ?1 ORDER BY {order_by} LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![since, limit as i64], |row| {
+            Ok(ObjectId::new(object_type, row.get::<_, i64>(0)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     fn load(&self, ids: &[ObjectId]) -> Result<Vec<Object>> {
         let mut by_type: HashMap<ObjectType, Vec<i64>> = HashMap::new();
         for id in ids {
@@ -774,5 +798,58 @@ mod tests {
         let st = SqliteStore::new(&conn);
         assert!(st.search_text(ObjectType::File, "   ", 10).unwrap().is_empty());
         assert!(st.search_text(ObjectType::Screenshot, "x", 10).is_err());
+    }
+
+    fn file_object_at(path: &str, modified_at: i64) -> NewObject {
+        let mut obj = file_object(path);
+        obj.metadata.updated_at = Some(modified_at);
+        obj
+    }
+
+    #[test]
+    fn recent_orders_files_by_modified_at_desc() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let old = st.save(&file_object_at("C:/p/old.rs", 100)).unwrap();
+        let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
+        let mid = st.save(&file_object_at("C:/p/mid.rs", 200)).unwrap();
+
+        let ids = st.recent(ObjectType::File, 0, 10).unwrap();
+        assert_eq!(ids, vec![new, mid, old], "most-recently-modified first");
+    }
+
+    #[test]
+    fn recent_respects_since_and_limit() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        st.save(&file_object_at("C:/p/old.rs", 100)).unwrap();
+        let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
+
+        let ids = st.recent(ObjectType::File, 200, 10).unwrap();
+        assert_eq!(ids, vec![new], "rows before `since` must be excluded");
+
+        let capped = st.recent(ObjectType::File, 0, 1).unwrap();
+        assert_eq!(capped.len(), 1, "limit is honoured");
+    }
+
+    #[test]
+    fn recent_orders_clipboard_by_insertion_not_declared_timestamp() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        // Inserted in this order — `recent` must reproduce id-DESC order,
+        // matching pre-Phase-4 `clipboard::search`'s no-text branch exactly,
+        // not a re-sort by `created_at`.
+        let first = st.save(&clip_object("first")).unwrap();
+        let second = st.save(&clip_object("second")).unwrap();
+
+        let ids = st.recent(ObjectType::Clipboard, 0, 10).unwrap();
+        assert_eq!(ids, vec![second, first]);
+    }
+
+    #[test]
+    fn recent_unsupported_type_errors() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        assert!(st.recent(ObjectType::Screenshot, 0, 10).is_err());
     }
 }

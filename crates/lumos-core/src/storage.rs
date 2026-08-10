@@ -125,6 +125,24 @@ pub trait ObjectStore {
     /// other stream of near-duplicate events.
     fn latest_text(&self, object_type: ObjectType) -> Result<Option<String>>;
 
+    /// Objects of this type at or after `since` (unix seconds), most-recent
+    /// first, capped to `limit` by storage — the text-less "today" /
+    /// "yesterday" / "week" browse mode.
+    ///
+    /// This is deliberately its own method rather than a degenerate case
+    /// of [`FullTextIndex::search_text`] or [`EmbeddingStore::nearest`]:
+    /// there is no query to match or embed here, so it doesn't fit either
+    /// trait's shape. "Recent" is a third, structurally distinct kind of
+    /// candidate — see `ARCHITECTURE_INVARIANTS.md`'s Phase 4 entry for the
+    /// conflict this resolves and why it isn't folded into RRF with the
+    /// other two.
+    ///
+    /// What "most-recent" means is a per-type storage decision (a file's
+    /// `modified_at` vs. a clipboard entry's insertion order) — the domain
+    /// only asks for "recent objects of this type since this time," not
+    /// which column that maps to.
+    fn recent(&self, object_type: ObjectType, since: i64, limit: usize) -> Result<Vec<ObjectId>>;
+
     /// Loads full objects by identity — the hydration step Search needs to
     /// turn an `EmbeddingStore::nearest`/`FullTextIndex::search_text` hit
     /// (a bare id) back into something with content and metadata.
