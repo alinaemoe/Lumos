@@ -1,4 +1,5 @@
 use crate::object::{ClipboardPayload, ObjectMetadata, ObjectPayload, ObjectType};
+use crate::pipeline::{ingest, Ingestable};
 use crate::search::sanitize_fts_query;
 use crate::storage::{EmbeddingStore, NewObject, ObjectStore};
 use anyhow::{Context, Result};
@@ -308,6 +309,7 @@ pub fn record_text<S>(store: &S, text: &str, source_app: Option<&str>) -> Result
 where
     S: ObjectStore + EmbeddingStore,
 {
+    // --- Normalize: cap to a sane size before anything else touches it. ---
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -315,12 +317,18 @@ where
     let capped = truncate_utf8(trimmed, MAX_TEXT_BYTES);
 
     // The duplicate *decision* is a domain rule; storage only supplies the
-    // text to compare against.
+    // text to compare against. Not a pipeline stage of its own — a gate
+    // specific to event streams like this one (see pipeline.rs).
     if store.latest_text(ObjectType::Clipboard)?.as_deref() == Some(capped) {
         return Ok(None);
     }
 
+    // --- Classify: detect type + build the synonym/decoded text that
+    // makes it findable by things other than its literal content. ---
     let detected = classify(capped);
+    let search_extra = build_search_extra(detected, capped);
+
+    // --- Normalize (continued): shape into the canonical Object envelope. ---
     let object = NewObject::new(
         ObjectMetadata {
             created_at: Some(now()),
@@ -332,14 +340,12 @@ where
             text_content: capped.to_string(),
             detected_type: detected.to_string(),
             pinned: false,
-            search_extra: Some(build_search_extra(detected, capped)),
+            search_extra: Some(search_extra),
         }),
     );
-    let id = store.save(&object)?;
 
-    // Best-effort, same reasoning as the file indexer: a missed/failed
-    // embedding degrades semantic search quietly, not clipboard recording.
-    let _ = crate::embeddings::store(store, id, capped);
+    // --- Embed + Store: shared with every other source, see pipeline.rs. ---
+    let id = ingest(store, Ingestable::new(object, Some(capped.to_string())))?;
 
     Ok(Some(id.local_id))
 }
@@ -465,4 +471,60 @@ pub fn purge_older_than(conn: &Connection, days: i64) -> Result<usize> {
     )
     .context("cleaning orphaned clipboard embeddings")?;
     Ok(removed)
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use crate::storage_sqlite::SqliteStore;
+
+    /// "raw clipboard event → Object → store → search/index remains
+    /// functional" — the clipboard half of Phase 3's acceptance test.
+    #[test]
+    fn clipboard_event_flows_through_to_search() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let store = SqliteStore::new(&conn);
+
+        let id = record_text(&store, "SELECT * FROM users WHERE id = 1", Some("VS Code"))
+            .unwrap()
+            .expect("non-empty, non-duplicate text must be recorded");
+
+        let (text, filters) = crate::search::parse_filters("users");
+        let hits = search(&conn, &text, &filters, 10).unwrap();
+        assert_eq!(hits.len(), 1, "the entry must be findable through FTS");
+        assert_eq!(hits[0].id, id);
+        assert_eq!(hits[0].detected_type, "sql");
+        assert_eq!(hits[0].source_app, Some("VS Code".to_string()));
+    }
+
+    #[test]
+    fn consecutive_duplicate_is_not_recorded_but_distinct_repeat_is() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let store = SqliteStore::new(&conn);
+
+        record_text(&store, "same thing", None).unwrap().unwrap();
+        let dup = record_text(&store, "same thing", None).unwrap();
+        assert_eq!(dup, None, "immediate repeat must be deduplicated");
+
+        record_text(&store, "different", None).unwrap().unwrap();
+        let again = record_text(&store, "same thing", None).unwrap();
+        assert!(again.is_some(), "same text is a new event once something else intervened");
+    }
+
+    #[test]
+    fn jwt_gets_classified_and_search_extra_populated() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let store = SqliteStore::new(&conn);
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig";
+
+        record_text(&store, jwt, None).unwrap().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM clipboard_entries WHERE detected_type = 'jwt' AND search_extra LIKE '%token%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "JWT classification and search_extra must survive the shared pipeline");
+    }
 }

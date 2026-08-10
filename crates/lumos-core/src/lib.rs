@@ -6,6 +6,7 @@ pub mod metadata;
 pub mod models;
 pub mod object;
 pub mod object_adapters;
+pub mod pipeline;
 pub mod scan;
 pub mod search;
 pub mod storage;
