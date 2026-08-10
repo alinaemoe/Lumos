@@ -365,10 +365,20 @@ fn row_to_result(row: &rusqlite::Row) -> rusqlite::Result<ClipboardResult> {
 /// `week` query prefix — see `search::parse_filters`. Kept here (rather
 /// than making callers build SQL themselves) so the WHERE-clause wiring
 /// lives next to the schema it targets.
+///
+/// `until` was added for `SearchIntent`'s Phase 5 upper time boundary
+/// (`search::parse_filters`'s "yesterday" branch now sets it). This
+/// module's own `search()`/its SQL never reads it — clipboard's standalone
+/// FTS command keeps its pre-existing since-only behavior unchanged,
+/// which is deliberate: extending this struct was the only way to give
+/// `parse_intent` an `until` value without duplicating token-scanning
+/// logic in a second function, and `#[derive(Default)]` means every other
+/// `Filters` construction site needed zero changes.
 #[derive(Debug, Default, Clone)]
 pub struct Filters {
     pub detected_type: Option<String>,
     pub since: Option<i64>,
+    pub until: Option<i64>,
 }
 
 pub fn search(conn: &Connection, query: &str, filters: &Filters, limit: i64) -> Result<Vec<ClipboardResult>> {

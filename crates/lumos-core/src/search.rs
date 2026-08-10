@@ -1,14 +1,22 @@
 //! Generic search — see `ARCHITECTURE_INVARIANTS.md` §4 and its Phase 4
 //! entries for the design history.
 //!
-//! `search_all` (the engine real callers use) never names `files`,
-//! `clipboard_entries`, `files_fts`, `clipboard_fts`, or `clipboard::search`
-//! — it retrieves candidates through [`FullTextIndex`], [`EmbeddingStore`],
-//! and [`ObjectStore::recent`], merges them by [`ObjectId`], fuses FTS and
-//! semantic rank via Reciprocal Rank Fusion, hydrates through
-//! [`ObjectStore::load`] in one batched call, and only then applies the
-//! filters/ranking signals that need real object data. `rusqlite` does not
-//! appear anywhere in this file.
+//! `search_all` (the generic engine, taking a [`SearchIntent`] directly) and
+//! its thin CLI wrapper `search_all_text` (raw string → `parse_intent` →
+//! `search_all`) never name `files`, `clipboard_entries`, `files_fts`,
+//! `clipboard_fts`, or `clipboard::search` — they retrieve candidates
+//! through [`FullTextIndex`], [`EmbeddingStore`], and [`ObjectStore::recent`],
+//! merge them by [`ObjectId`], fuse FTS and semantic rank via Reciprocal
+//! Rank Fusion, hydrate through [`ObjectStore::load`] in one batched call,
+//! and only then apply the filters/ranking signals that need real object
+//! data. `rusqlite` does not appear anywhere in this file's production
+//! code (only in test helpers, which need a concrete backing store).
+//!
+//! The `search_all`/`search_all_text` split is the point of Phase 5: any
+//! producer of a well-formed `SearchIntent` — the CLI parser today, an
+//! LLM/natural-language interpreter eventually — can call `search_all`
+//! directly, without going through a string at all. See `SearchIntent`'s
+//! own doc comment for the contract that makes this work.
 //!
 //! `search()` is a separate, deliberately smaller thing — the CLI's raw
 //! FTS-only smoke-test command (`lumos search <query>`), unchanged in
@@ -65,16 +73,28 @@ fn now_ts() -> i64 {
 
 /// Pulls `type:xxx` / `today` / `yesterday` / `week` tokens out of the raw
 /// query string, leaving whatever's left as the free-text portion. These
-/// are relative-hours windows (24h / 48h / 7d back from now), not calendar-
-/// day boundaries — exact "midnight to midnight" would need timezone
-/// handling we don't have; "at least this recent" is close enough and a lot
-/// simpler to reason about (each filter is a strict superset of the
-/// previous one, so there's no surprising off-by-one at day boundaries).
+/// are relative-hours windows, not calendar-day boundaries — exact
+/// "midnight to midnight" would need timezone handling we don't have;
+/// "N hours back from now" is close enough and a lot simpler to reason
+/// about.
+///
+/// `today` and `week` stay pure lower bounds (open-ended up to now — there
+/// is no meaningful upper bound distinct from "now" for either). `yesterday`
+/// is the one case with a real, distinct upper bound, so as of Phase 5 it
+/// sets both `since` and `until`, narrowing to a specific rolling 24h window
+/// one day back rather than the old "at least 48h old" superset. This is a
+/// deliberate, disclosed behavior change for `yesterday` specifically — see
+/// `ARCHITECTURE_INVARIANTS.md`'s Phase 5 entry — not an oversight: the old
+/// since-only "yesterday" silently included today's results too, which is
+/// not what the word means.
 ///
 /// Kept as its own function (rather than folded into `parse_intent`)
 /// because `clipboard::search`/the CLI's standalone `clipboard search`
 /// command call it directly against `Filters`, independent of the generic
-/// engine — Phase 4 didn't touch that path.
+/// engine — Phase 4 didn't touch that path, and Phase 5 doesn't either:
+/// `clipboard::search`'s SQL never reads `Filters::until`, so that command's
+/// behavior for `since` is byte-for-byte unchanged even though this function
+/// now also populates `until` for it to ignore.
 pub fn parse_filters(raw: &str) -> (String, Filters) {
     let mut filters = Filters::default();
     let mut remaining = Vec::new();
@@ -87,6 +107,7 @@ pub fn parse_filters(raw: &str) -> (String, Filters) {
             filters.since = Some(now_ts() - 86_400);
         } else if lower == "yesterday" {
             filters.since = Some(now_ts() - 2 * 86_400);
+            filters.until = Some(now_ts() - 86_400);
         } else if lower == "week" {
             filters.since = Some(now_ts() - 7 * 86_400);
         } else {
@@ -97,20 +118,48 @@ pub fn parse_filters(raw: &str) -> (String, Filters) {
     (remaining.join(" "), filters)
 }
 
-/// What the generic search engine actually consumes. Replaces the old
-/// `(String, Filters)` tuple with a named type per Phase 4.
+/// What the generic search engine actually consumes — the stable contract
+/// between *any* intent producer (today: `parse_intent`'s CLI-syntax
+/// parser; eventually: an LLM/natural-language interpreter) and
+/// `search_all`. Neither producer nor engine needs to know about the
+/// other — see `ARCHITECTURE_INVARIANTS.md`'s Phase 5 entry for the design
+/// history this contract review is based on.
 ///
-/// `object_types` and `detected_type` are unrelated axes that happen to
-/// share the word "type" in casual conversation — see the long note on
-/// `ObjectType` in `object.rs`. `detected_type` here means exactly what it
-/// always has (`type:jwt`, clipboard-only); `object_types` is new — which
-/// *sources* to search at all.
+/// **Contract rules, binding on every producer of this type:**
+///
+/// 1. Every field except `text` must already hold a *resolved* value —
+///    an epoch, an id, a known `ObjectType` — never a raw natural-language
+///    fragment ("yesterday", "project X"). Resolving those is the
+///    producer's job (the CLI parser resolves relative dates; an LLM
+///    interpreter would need to resolve a project name to an id the same
+///    way). `text` is the sole exception, and *only* because it flows into
+///    fuzzy FTS/semantic retrieval, which needs free text by definition.
+/// 2. `object_types` must never be empty. "Search everywhere" is
+///    [`all_object_types`], spelled out — not the absence of a
+///    restriction. `search_all` treats an empty vector as a contract
+///    violation and returns an error rather than silently searching
+///    nothing (see its doc comment for why this specific footgun matters).
+/// 3. `object_types` (which *sources* to search) and `detected_type`
+///    (clipboard's own content classification — `jwt`/`sql`/...) are
+///    unrelated axes that happen to share the word "type" in casual
+///    conversation. See the long note on `ObjectType` in `object.rs`.
+///    Source-specific structured filters that aren't `object_types` or
+///    `detected_type` (an email sender, a browser URL, ...) do not get
+///    their own field here — they degrade to free-text `text` and rely on
+///    that source indexing the relevant text. Adding a field per
+///    source-specific attribute would turn this struct into exactly the
+///    "one field per source" pattern the generic engine exists to avoid;
+///    the boundary is enforced here, in the contract, not in the engine.
 #[derive(Debug, Clone)]
 pub struct SearchIntent {
     pub text: String,
     pub object_types: Vec<ObjectType>,
     pub detected_type: Option<String>,
+    /// Inclusive lower time boundary — objects at or after this instant.
     pub since: Option<i64>,
+    /// Inclusive upper time boundary — objects at or before this instant.
+    /// Independent of `since`; either, both, or neither may be set.
+    pub until: Option<i64>,
     /// No query syntax sets this yet — always `None` from `parse_intent`.
     /// Present now because the ranking function (`project_boost`) already
     /// needs somewhere to read a project filter from once one exists,
@@ -120,6 +169,43 @@ pub struct SearchIntent {
     pub project_id: Option<i64>,
 }
 
+/// Every `ObjectType` the generic search engine can search today —
+/// "search everywhere" spelled out explicitly, per rule 2 of
+/// [`SearchIntent`]'s contract. Never construct "everywhere" as an empty
+/// `object_types` vector; use this instead.
+///
+/// The inner match is exhaustive on purpose: adding a new `ObjectType`
+/// variant without touching it fails to compile (a "non-exhaustive
+/// patterns" error), which is the "fail loudly on a new variant" behavior
+/// the Phase 5 brief asked for. Same idiom `storage_sqlite.rs` already
+/// uses for `type_tag`/`source_table`. It does not (and cannot, without a
+/// derive-macro dependency this crate doesn't have) automatically discover
+/// new variants — the array literal below still has to be kept in sync by
+/// hand — but it does guarantee no variant can be silently misclassified
+/// once it's in that list.
+pub fn all_object_types() -> Vec<ObjectType> {
+    fn is_supported_by_generic_search(t: ObjectType) -> bool {
+        match t {
+            ObjectType::File | ObjectType::Clipboard => true,
+            ObjectType::Screenshot
+            | ObjectType::BrowserVisit
+            | ObjectType::Session
+            | ObjectType::Email => false,
+        }
+    }
+    [
+        ObjectType::File,
+        ObjectType::Clipboard,
+        ObjectType::Screenshot,
+        ObjectType::BrowserVisit,
+        ObjectType::Session,
+        ObjectType::Email,
+    ]
+    .into_iter()
+    .filter(|&t| is_supported_by_generic_search(t))
+    .collect()
+}
+
 /// Builds a [`SearchIntent`] from raw query text using the existing
 /// `type:`/`today`/`yesterday`/`week` parser.
 ///
@@ -127,19 +213,20 @@ pub struct SearchIntent {
 /// before Phase 4: a `detected_type` filter means "clipboard only" (files
 /// have no `detected_type`, and searching `type:jwt` against filenames was
 /// already documented as "just confusing" pre-Phase-4) — everything else
-/// searches both sources known today.
+/// searches [`all_object_types`].
 pub fn parse_intent(raw: &str) -> SearchIntent {
     let (text, filters) = parse_filters(raw);
     let object_types = if filters.detected_type.is_some() {
         vec![ObjectType::Clipboard]
     } else {
-        vec![ObjectType::File, ObjectType::Clipboard]
+        all_object_types()
     };
     SearchIntent {
         text,
         object_types,
         detected_type: filters.detected_type,
         since: filters.since,
+        until: filters.until,
         project_id: None,
     }
 }
@@ -245,19 +332,22 @@ where
                     rank: rank + 1,
                 });
             }
-        } else if intent.since.is_some() || intent.detected_type.is_some() {
+        } else if intent.since.is_some() || intent.until.is_some() || intent.detected_type.is_some() {
             // No text to match/embed — this is a listing, not a search.
-            // Triggered by `since` ("today"/"week") *or* `detected_type`
-            // alone ("type:jwt" with nothing else): pre-Phase-4
-            // `clipboard::search`'s text-less branch fired on either
-            // condition (`if !has_text && detected_type.is_none() &&
-            // since.is_none() { return empty }`), not `since` only —
-            // missing this the first time through produced `type:jwt`
-            // returning zero results, caught by the CLI smoke test rather
-            // than left as a silent regression. `since` defaults to
-            // "the beginning of time" so a `detected_type`-only intent
-            // still lists everything of that type; `matches_since`/
-            // `matches_detected_type` after hydration narrow it down.
+            // Triggered by `since` ("today"/"week"), `until` (a future
+            // interpreter producing "before yesterday" with no lower
+            // bound), or `detected_type` alone ("type:jwt" with nothing
+            // else): pre-Phase-4 `clipboard::search`'s text-less branch
+            // fired on the equivalent of any of these, not `since` only —
+            // missing this the first time through Phase 4 produced
+            // `type:jwt` returning zero results, caught by the CLI smoke
+            // test rather than left as a silent regression. `since`
+            // defaults to "the beginning of time" so a `detected_type`- or
+            // `until`-only intent still lists everything up to that point;
+            // `matches_time_bounds`/`matches_detected_type` after
+            // hydration narrow it down further (`ObjectStore::recent` only
+            // takes a lower bound — `until` is applied post-hydration like
+            // `since` already was).
             let since = intent.since.unwrap_or(i64::MIN);
             for (rank, object_id) in store.recent(object_type, since, fetch_n)?.into_iter().enumerate() {
                 candidates.push(Candidate {
@@ -321,14 +411,20 @@ fn matches_detected_type(object: &Object, wanted: &Option<String>) -> bool {
 /// `updated_at` is its `modified_at` (what the old code filtered files on),
 /// a clipboard entry has no `updated_at` so this falls back to
 /// `created_at` (what the old code filtered clipboard on).
-fn matches_since(object: &Object, since: Option<i64>) -> bool {
-    let Some(since) = since else { return true };
-    object
-        .metadata
-        .updated_at
-        .or(object.metadata.created_at)
-        .map(|ts| ts >= since)
-        .unwrap_or(false)
+///
+/// `since`/`until` are independent and both optional (`SearchIntent`'s
+/// contract rule 1) — a missing timestamp on the object excludes it
+/// whenever *either* bound is active, matching the pre-Phase-5 SQL
+/// behavior for `since` (`NULL >= ?` is falsy in SQLite) extended
+/// symmetrically to `until`.
+fn matches_time_bounds(object: &Object, since: Option<i64>, until: Option<i64>) -> bool {
+    if since.is_none() && until.is_none() {
+        return true;
+    }
+    let Some(ts) = object.metadata.updated_at.or(object.metadata.created_at) else {
+        return false;
+    };
+    since.map(|s| ts >= s).unwrap_or(true) && until.map(|u| ts <= u).unwrap_or(true)
 }
 
 /// Same "recency timestamp" convention as `matches_since` — generic,
@@ -422,21 +518,43 @@ fn to_search_hit(object: Object) -> SearchHit {
 }
 
 /// The generic engine: `SearchIntent` → candidates → merge/RRF → hydrate →
-/// filter → rank → limit → frontend-compatible results. This is the
-/// function both the CLI's `search-all` and the Tauri `search_files`
-/// command call — see their call sites for how a `Connection` becomes the
-/// generic `S` this takes.
-pub fn search_all<S>(store: &S, raw_query: &str, limit: i64) -> Result<Vec<SearchHit>>
+/// filter → rank → limit → frontend-compatible results.
+///
+/// Takes an already-built [`SearchIntent`] — this is the seam Phase 5
+/// exists to secure: the CLI's `parse_intent` and a future LLM/
+/// natural-language interpreter are two independent, equally valid
+/// producers of that type, and neither this function nor anything it
+/// calls needs to know or care which one produced the intent it's given.
+/// [`search_all_text`] below is the CLI-syntax convenience wrapper — it is
+/// the *only* thing in this module that still takes a raw string.
+///
+/// Returns an error if `intent.object_types` is empty. This is deliberate,
+/// not defensive paranoia: an empty vector could plausibly be an LLM's
+/// (wrong) encoding of "no restriction, search everything" — see rule 2 of
+/// `SearchIntent`'s contract — and the pre-Phase-5 failure mode for that
+/// exact mistake was `retrieve_candidates` silently iterating zero times
+/// and returning zero results, indistinguishable from "nothing matched."
+/// Erroring here converts a silent wrong-answer into a caller-visible
+/// problem the caller can recover from (e.g. by falling back to
+/// `all_object_types()`), which is strictly better than either extreme
+/// (guessing "empty means everything" would also be wrong: that reading
+/// isn't in the contract, so guessing it here would just move the
+/// silent-wrongness to a different mistake).
+pub fn search_all<S>(store: &S, intent: &SearchIntent, limit: i64) -> Result<Vec<SearchHit>>
 where
     S: FullTextIndex + EmbeddingStore + ObjectStore,
 {
-    let intent = parse_intent(raw_query);
+    if intent.object_types.is_empty() {
+        return Err(anyhow::anyhow!(
+            "SearchIntent.object_types must not be empty — use all_object_types() for \"search everywhere\", never an empty Vec"
+        ));
+    }
     let limit = limit.max(0) as usize;
     if limit == 0 {
         return Ok(Vec::new());
     }
 
-    let candidates = retrieve_candidates(store, &intent, limit)?;
+    let candidates = retrieve_candidates(store, intent, limit)?;
     let fused = merge_candidates(candidates);
 
     let ids: Vec<ObjectId> = fused.keys().copied().collect();
@@ -451,7 +569,7 @@ where
         // already treats that as "omit, don't error" (see its doc), and
         // this follows the same rule rather than treating it as a bug.
         let Some(object) = objects.remove(&id) else { continue };
-        if !matches_since(&object, intent.since) {
+        if !matches_time_bounds(&object, intent.since, intent.until) {
             continue;
         }
         if !matches_detected_type(&object, &intent.detected_type) {
@@ -468,6 +586,20 @@ where
     ranked.truncate(limit);
 
     Ok(ranked.into_iter().map(|(_, obj)| to_search_hit(obj)).collect())
+}
+
+/// Thin CLI-syntax compatibility wrapper: `raw query -> parse_intent ->
+/// SearchIntent -> search_all`. This is the function the CLI's
+/// `search-all` and the Tauri `search_files` command call — everything
+/// downstream of `parse_intent` here is identical to what a future LLM
+/// interpreter's output would go through, just reached via a different
+/// front door.
+pub fn search_all_text<S>(store: &S, raw_query: &str, limit: i64) -> Result<Vec<SearchHit>>
+where
+    S: FullTextIndex + EmbeddingStore + ObjectStore,
+{
+    let intent = parse_intent(raw_query);
+    search_all(store, &intent, limit)
 }
 
 /// The CLI's raw FTS-only smoke-test command (`lumos search <query>`) —
@@ -563,7 +695,7 @@ mod tests {
         let st = SqliteStore::new(&conn);
         let id = st.save(&file_at("C:/p/hydration_notes.rs", "hydration_notes.rs", 100, None)).unwrap();
 
-        let intent = SearchIntent { text: "hydration_notes".into(), object_types: vec![ObjectType::File], detected_type: None, since: None, project_id: None };
+        let intent = SearchIntent { text: "hydration_notes".into(), object_types: vec![ObjectType::File], detected_type: None, since: None, until: None, project_id: None };
         let candidates = retrieve_candidates(&st, &intent, 10).unwrap();
         assert!(candidates.iter().any(|c| c.object_id == id && c.source == RetrievalSource::FullText));
     }
@@ -574,7 +706,7 @@ mod tests {
         let st = SqliteStore::new(&conn);
         let id = st.save(&clip_at("SELECT * FROM users", "sql", 100)).unwrap();
 
-        let intent = SearchIntent { text: "users".into(), object_types: vec![ObjectType::Clipboard], detected_type: None, since: None, project_id: None };
+        let intent = SearchIntent { text: "users".into(), object_types: vec![ObjectType::Clipboard], detected_type: None, since: None, until: None, project_id: None };
         let candidates = retrieve_candidates(&st, &intent, 10).unwrap();
         assert!(candidates.iter().any(|c| c.object_id == id && c.source == RetrievalSource::FullText));
     }
@@ -588,7 +720,7 @@ mod tests {
         let st = SqliteStore::new(&conn);
         let id = st.save(&file_at("C:/p/main.rs", "main.rs", 100, None)).unwrap();
 
-        let intent = SearchIntent { text: "main".into(), object_types: vec![ObjectType::File], detected_type: None, since: None, project_id: None };
+        let intent = SearchIntent { text: "main".into(), object_types: vec![ObjectType::File], detected_type: None, since: None, until: None, project_id: None };
         let candidates = retrieve_candidates(&st, &intent, 10).unwrap();
         assert!(candidates.iter().any(|c| c.object_id == id && c.source == RetrievalSource::FullText));
         assert!(
@@ -603,7 +735,7 @@ mod tests {
         let st = SqliteStore::new(&conn);
         let id = st.save(&file_at("C:/p/a.rs", "a.rs", 500, None)).unwrap();
 
-        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::File], detected_type: None, since: Some(100), project_id: None };
+        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::File], detected_type: None, since: Some(100), until: None, project_id: None };
         let candidates = retrieve_candidates(&st, &intent, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].object_id, id);
@@ -618,7 +750,7 @@ mod tests {
         let st = SqliteStore::new(&conn);
         let id = st.save(&clip_at("eyJ.eyJ.sig", "jwt", 100)).unwrap();
 
-        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::Clipboard], detected_type: Some("jwt".into()), since: None, project_id: None };
+        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::Clipboard], detected_type: Some("jwt".into()), since: None, until: None, project_id: None };
         let candidates = retrieve_candidates(&st, &intent, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].object_id, id);
@@ -631,7 +763,7 @@ mod tests {
         let st = SqliteStore::new(&conn);
         st.save(&file_at("C:/p/a.rs", "a.rs", 100, None)).unwrap();
 
-        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::File], detected_type: None, since: None, project_id: None };
+        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::File], detected_type: None, since: None, until: None, project_id: None };
         assert!(retrieve_candidates(&st, &intent, 10).unwrap().is_empty());
     }
 
@@ -639,7 +771,7 @@ mod tests {
     fn retrieval_unsupported_object_type_propagates_error() {
         let conn = store_conn();
         let st = SqliteStore::new(&conn);
-        let intent = SearchIntent { text: "x".into(), object_types: vec![ObjectType::Screenshot], detected_type: None, since: None, project_id: None };
+        let intent = SearchIntent { text: "x".into(), object_types: vec![ObjectType::Screenshot], detected_type: None, since: None, until: None, project_id: None };
         assert!(retrieve_candidates(&st, &intent, 10).is_err());
     }
 
@@ -702,13 +834,36 @@ mod tests {
     // ---- Generic filters / signals ----
 
     #[test]
-    fn matches_since_uses_updated_at_then_falls_back_to_created_at() {
+    fn matches_time_bounds_uses_updated_at_then_falls_back_to_created_at() {
         let file_obj = Object::new(1, ObjectMetadata { created_at: Some(1), updated_at: Some(500), project_id: None, source: None }, ObjectPayload::File(FilePayload { path: "x".into(), filename: "x".into(), extension: None, size: 0, hash: None, project_name: None }));
-        assert!(matches_since(&file_obj, Some(500)));
-        assert!(!matches_since(&file_obj, Some(501)));
+        assert!(matches_time_bounds(&file_obj, Some(500), None));
+        assert!(!matches_time_bounds(&file_obj, Some(501), None));
 
         let clip_obj = Object::new(1, ObjectMetadata { created_at: Some(500), updated_at: None, project_id: None, source: None }, ObjectPayload::Clipboard(ClipboardPayload { text_content: "x".into(), detected_type: "text".into(), pinned: false, search_extra: None }));
-        assert!(matches_since(&clip_obj, Some(500)), "clipboard has no updated_at, must fall back to created_at");
+        assert!(matches_time_bounds(&clip_obj, Some(500), None), "clipboard has no updated_at, must fall back to created_at");
+    }
+
+    #[test]
+    fn matches_time_bounds_supports_since_and_until_independently_and_together() {
+        let obj_at = |ts: i64| Object::new(1, ObjectMetadata { created_at: Some(ts), updated_at: None, project_id: None, source: None }, ObjectPayload::File(FilePayload { path: "x".into(), filename: "x".into(), extension: None, size: 0, hash: None, project_name: None }));
+
+        // since without until
+        assert!(matches_time_bounds(&obj_at(500), Some(400), None));
+        assert!(!matches_time_bounds(&obj_at(300), Some(400), None));
+
+        // until without since
+        assert!(matches_time_bounds(&obj_at(300), None, Some(400)));
+        assert!(!matches_time_bounds(&obj_at(500), None, Some(400)));
+
+        // both together — inclusive window
+        assert!(matches_time_bounds(&obj_at(350), Some(300), Some(400)));
+        assert!(matches_time_bounds(&obj_at(300), Some(300), Some(400)), "since bound is inclusive");
+        assert!(matches_time_bounds(&obj_at(400), Some(300), Some(400)), "until bound is inclusive");
+        assert!(!matches_time_bounds(&obj_at(250), Some(300), Some(400)));
+        assert!(!matches_time_bounds(&obj_at(450), Some(300), Some(400)));
+
+        // neither bound — always passes
+        assert!(matches_time_bounds(&obj_at(999), None, None));
     }
 
     #[test]
@@ -737,7 +892,7 @@ mod tests {
         st.save(&file_at("C:/p/hydration_notes.rs", "hydration_notes.rs", 100, None)).unwrap();
         st.save(&clip_at("hydration failed in react", "text", 200)).unwrap();
 
-        let hits = search_all(&st, "hydration", 10).unwrap();
+        let hits = search_all_text(&st, "hydration", 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|h| matches!(h, SearchHit::File(_))));
         assert!(hits.iter().any(|h| matches!(h, SearchHit::Clipboard(_))));
@@ -750,7 +905,7 @@ mod tests {
         st.save(&clip_at("react", "text", 100)).unwrap();
         st.save(&clip_at("a note about react hooks", "text", 100)).unwrap();
 
-        let hits = search_all(&st, "react", 10).unwrap();
+        let hits = search_all_text(&st, "react", 10).unwrap();
         assert_eq!(hits.len(), 2);
         // Both are found by FTS; the exact-text entry should rank first
         // due to the exactness boost, regardless of storage/load order.
@@ -767,7 +922,7 @@ mod tests {
         st.save(&file_at("C:/p/jwt_notes.rs", "jwt_notes.rs", 100, None)).unwrap();
         st.save(&clip_at("eyJ.eyJ.sig", "jwt", 100)).unwrap();
 
-        let hits = search_all(&st, "type:jwt", 10).unwrap();
+        let hits = search_all_text(&st, "type:jwt", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(matches!(hits[0], SearchHit::Clipboard(_)));
     }
@@ -780,7 +935,7 @@ mod tests {
         st.save(&file_at("C:/p/recent.rs", "recent.rs", now, None)).unwrap();
         st.save(&file_at("C:/p/ancient.rs", "ancient.rs", now - 100 * 86_400, None)).unwrap();
 
-        let hits = search_all(&st, "today", 10).unwrap();
+        let hits = search_all_text(&st, "today", 10).unwrap();
         assert_eq!(hits.len(), 1, "only the file modified within the last 24h should be listed");
     }
 
@@ -791,7 +946,7 @@ mod tests {
         st.save(&clip_at("eyJ.eyJ.sig", "jwt", 100)).unwrap();
         st.save(&clip_at("SELECT 1", "sql", 100)).unwrap();
 
-        let hits = search_all(&st, "type:jwt", 10).unwrap();
+        let hits = search_all_text(&st, "type:jwt", 10).unwrap();
         assert_eq!(hits.len(), 1);
         match &hits[0] {
             SearchHit::Clipboard(c) => assert_eq!(c.detected_type, "jwt"),
@@ -804,8 +959,8 @@ mod tests {
         let conn = store_conn();
         let st = SqliteStore::new(&conn);
         st.save(&file_at("C:/p/a.rs", "a.rs", 100, None)).unwrap();
-        assert!(search_all(&st, "", 10).unwrap().is_empty());
-        assert!(search_all(&st, "   ", 10).unwrap().is_empty());
+        assert!(search_all_text(&st, "", 10).unwrap().is_empty());
+        assert!(search_all_text(&st, "   ", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -819,7 +974,7 @@ mod tests {
         let clip_id = st.save(&clip_at("shared note", "text", 100)).unwrap();
         assert_eq!(file_id.local_id, clip_id.local_id, "test setup: both must actually share a local_id");
 
-        let hits = search_all(&st, "shared", 10).unwrap();
+        let hits = search_all_text(&st, "shared", 10).unwrap();
         assert_eq!(hits.len(), 2, "File(1) and Clipboard(1) must both survive dedup as distinct objects");
     }
 
@@ -830,7 +985,7 @@ mod tests {
         for i in 0..5 {
             st.save(&clip_at(&format!("needle entry number {i}"), "text", 100 + i)).unwrap();
         }
-        let hits = search_all(&st, "needle", 2).unwrap();
+        let hits = search_all_text(&st, "needle", 2).unwrap();
         assert_eq!(hits.len(), 2, "limit must cap the final ranked list, not the raw candidate pool");
     }
 
@@ -842,7 +997,7 @@ mod tests {
         st.save(&file_at("C:/p/frontend_probe.rs", "frontend_probe.rs", 100, Some(project_id))).unwrap();
         st.save(&clip_at("frontend_probe clip", "text", 100)).unwrap();
 
-        let hits = search_all(&st, "frontend_probe", 10).unwrap();
+        let hits = search_all_text(&st, "frontend_probe", 10).unwrap();
         for hit in hits {
             match hit {
                 SearchHit::File(f) => {
@@ -891,5 +1046,177 @@ mod tests {
         let st = SqliteStore::new(&conn);
         st.save(&file_at("C:/p/a.rs", "a.rs", 100, None)).unwrap();
         assert!(search(&st, "", None, 10).unwrap().is_empty());
+    }
+
+    // ---- Phase 5: SearchIntent contract (until, object_types, split entry point) ----
+
+    #[test]
+    fn parse_intent_populates_until_for_yesterday() {
+        let intent = parse_intent("yesterday");
+        assert!(intent.since.is_some());
+        assert!(intent.until.is_some(), "yesterday must set a real upper bound, unlike today/week");
+        assert!(intent.since.unwrap() < intent.until.unwrap());
+    }
+
+    #[test]
+    fn parse_intent_today_and_week_leave_until_unset() {
+        assert!(parse_intent("today").until.is_none());
+        assert!(parse_intent("week").until.is_none());
+    }
+
+    #[test]
+    fn since_and_until_together_bound_search_all_results() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let now = crate::now_secs();
+        st.save(&file_at("C:/p/too_old.rs", "too_old.rs", now - 300, None)).unwrap();
+        let in_window = st.save(&file_at("C:/p/in_window.rs", "in_window.rs", now - 150, None)).unwrap();
+        st.save(&file_at("C:/p/too_new.rs", "too_new.rs", now - 10, None)).unwrap();
+
+        let intent = SearchIntent {
+            text: "".into(),
+            object_types: vec![ObjectType::File],
+            detected_type: None,
+            since: Some(now - 200),
+            until: Some(now - 100),
+            project_id: None,
+        };
+        let hits = search_all(&st, &intent, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            SearchHit::File(f) => assert_eq!(f.id, in_window.local_id),
+            _ => panic!("expected file"),
+        }
+    }
+
+    #[test]
+    fn since_alone_still_works_without_until() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let now = crate::now_secs();
+        let recent = st.save(&file_at("C:/p/recent.rs", "recent.rs", now, None)).unwrap();
+        st.save(&file_at("C:/p/old.rs", "old.rs", now - 1000, None)).unwrap();
+
+        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::File], detected_type: None, since: Some(now - 10), until: None, project_id: None };
+        let hits = search_all(&st, &intent, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            SearchHit::File(f) => assert_eq!(f.id, recent.local_id),
+            _ => panic!("expected file"),
+        }
+    }
+
+    #[test]
+    fn until_alone_works_without_since() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let now = crate::now_secs();
+        let old = st.save(&file_at("C:/p/old.rs", "old.rs", now - 1000, None)).unwrap();
+        st.save(&file_at("C:/p/recent.rs", "recent.rs", now, None)).unwrap();
+
+        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::File], detected_type: None, since: None, until: Some(now - 500), project_id: None };
+        let hits = search_all(&st, &intent, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            SearchHit::File(f) => assert_eq!(f.id, old.local_id),
+            _ => panic!("expected file"),
+        }
+    }
+
+    #[test]
+    fn search_all_rejects_empty_object_types() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let intent = SearchIntent { text: "x".into(), object_types: vec![], detected_type: None, since: None, until: None, project_id: None };
+        let err = search_all(&st, &intent, 10).unwrap_err();
+        assert!(err.to_string().contains("object_types"));
+    }
+
+    #[test]
+    fn all_object_types_is_the_explicit_search_everywhere_list() {
+        let types = all_object_types();
+        assert!(types.contains(&ObjectType::File));
+        assert!(types.contains(&ObjectType::Clipboard));
+        assert!(!types.is_empty());
+        // Sources with no storage backing yet must not be claimed as
+        // "searchable" by this list.
+        assert!(!types.contains(&ObjectType::Screenshot));
+        assert!(!types.contains(&ObjectType::Email));
+    }
+
+    #[test]
+    fn parse_intent_never_produces_empty_object_types() {
+        for query in ["", "  ", "hello", "type:jwt", "today", "type:sql yesterday"] {
+            assert!(!parse_intent(query).object_types.is_empty(), "query {query:?} produced empty object_types");
+        }
+    }
+
+    #[test]
+    fn detected_type_behavior_is_unchanged_by_phase_5() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        st.save(&clip_at("eyJ.eyJ.sig", "jwt", 100)).unwrap();
+        st.save(&file_at("C:/p/jwt.rs", "jwt.rs", 100, None)).unwrap();
+
+        let intent = parse_intent("type:jwt");
+        assert_eq!(intent.object_types, vec![ObjectType::Clipboard], "detected_type still means clipboard-only");
+        let hits = search_all(&st, &intent, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0], SearchHit::Clipboard(_)));
+    }
+
+    #[test]
+    fn project_filtering_behavior_is_unchanged_by_phase_5() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let project_id = st.get_or_create_project("demo").unwrap();
+        let in_project = st.save(&file_at("C:/p/in_project.rs", "in_project.rs", 100, Some(project_id))).unwrap();
+        st.save(&file_at("C:/p/other.rs", "other.rs", 100, None)).unwrap();
+
+        // project_id still only nudges ranking, exactly as before Phase 5
+        // — it is not (and was never) a hard filter.
+        let intent = SearchIntent { text: "".into(), object_types: vec![ObjectType::File], detected_type: None, since: Some(0), until: None, project_id: Some(project_id) };
+        let hits = search_all(&st, &intent, 10).unwrap();
+        assert_eq!(hits.len(), 2, "project_id boosts ranking, it does not exclude non-matching objects");
+        match &hits[0] {
+            SearchHit::File(f) => assert_eq!(f.id, in_project.local_id, "the matching-project file must rank first"),
+            _ => panic!("expected file"),
+        }
+    }
+
+    #[test]
+    fn existing_cli_queries_produce_the_same_results_via_search_all_text() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        st.save(&file_at("C:/p/hydration_notes.rs", "hydration_notes.rs", 100, None)).unwrap();
+        st.save(&clip_at("SELECT * FROM users", "sql", 100)).unwrap();
+
+        for query in ["hydration_notes", "users", "type:sql", "", "   "] {
+            let via_text = search_all_text(&st, query, 10).unwrap();
+            let via_intent = search_all(&st, &parse_intent(query), 10).unwrap();
+            assert_eq!(via_text.len(), via_intent.len(), "query {query:?} must behave identically through both entry points");
+        }
+    }
+
+    #[test]
+    fn a_manually_constructed_intent_reaches_search_all_without_the_string_parser() {
+        // This is the whole point of Phase 5: an intent that never touched
+        // `parse_intent`/`parse_filters` — standing in for a future LLM
+        // interpreter's output — must work identically to a CLI-parsed one.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        st.save(&clip_at("hydration failed in react", "text", 100)).unwrap();
+
+        let intent = SearchIntent {
+            text: "hydration".into(),
+            object_types: all_object_types(),
+            detected_type: None,
+            since: None,
+            until: None,
+            project_id: None,
+        };
+        let hits = search_all(&st, &intent, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0], SearchHit::Clipboard(_)));
     }
 }

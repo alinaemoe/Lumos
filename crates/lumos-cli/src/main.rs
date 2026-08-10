@@ -169,7 +169,7 @@ fn run_search(conn: &Connection, query: &str) -> Result<()> {
 }
 
 fn run_search_all(conn: &Connection, query: &str) -> Result<()> {
-    let hits = search::search_all(&SqliteStore::new(conn), query, 20)?;
+    let hits = search::search_all_text(&SqliteStore::new(conn), query, 20)?;
     if hits.is_empty() {
         println!("no matches for {query:?}");
         return Ok(());

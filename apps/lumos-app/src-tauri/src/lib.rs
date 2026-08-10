@@ -19,7 +19,7 @@ struct SuppressBlurHide(AtomicBool);
 #[tauri::command]
 fn search_files(state: tauri::State<DbState>, query: String) -> Result<Vec<SearchHit>, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    lumos_core::search::search_all(&SqliteStore::new(&conn), &query, 30).map_err(|e| e.to_string())
+    lumos_core::search::search_all_text(&SqliteStore::new(&conn), &query, 30).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
