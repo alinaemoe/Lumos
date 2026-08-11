@@ -249,16 +249,79 @@ pub fn backfill_all(st: &impl EmbeddingStore) -> Result<(usize, usize)> {
     Ok((counts[0], counts[1]))
 }
 
+/// How far below the best match's score a candidate may fall and still be
+/// considered relevant, rather than padding.
+///
+/// **Why relative to the top score, not an absolute cutoff.** Measured
+/// directly against real production data (`multilingual-e5-small`, this
+/// crate's actual model): cosine similarity for short, non-natural-language
+/// strings — tokens, filenames, UUIDs, JSON fragments, exactly the bulk of
+/// what Lumos indexes — sits in a narrow, anisotropic band regardless of
+/// query. A query with **zero** genuinely related content in the corpus
+/// ("recipe for chicken soup" against a clipboard history full of tokens
+/// and stack traces) still scored 0.79–0.81 against everything; a query
+/// with genuine matches ("jwt") scored top candidates at 0.82–0.84 —
+/// *overlapping* the no-match baseline, not clearly separated from it. An
+/// absolute threshold cannot thread that needle: set it above ~0.81 and a
+/// no-match query still returns nothing useful anyway so the floor doesn't
+/// matter, but set it below ~0.84 and it admits most of the no-match
+/// baseline too. There is no single number that is simultaneously "above
+/// the noise floor" and "below genuine matches," because the two overlap.
+///
+/// A margin relative to *that query's own best score* sidesteps this: it
+/// doesn't ask "is this an absolutely good match" (unanswerable given the
+/// overlap above), only "is this meaningfully worse than the best thing
+/// this query found" — which adapts automatically to wherever that
+/// query's baseline happens to sit, without needing to know it in advance.
+///
+/// **Measured basis for the value.** Across the genuine-match cases
+/// checked (a `jwt` query against real JWT-classified clipboard entries;
+/// a `sql` query against a real SQL clipboard entry), the true match sat
+/// 0.017–0.027 below that query's top score. `0.03` is set just above
+/// that observed range — a first-pass empirical constant from this one
+/// investigation, not a tuned final value, same honesty as this crate's
+/// other ranking constants (see `search.rs`'s `RRF_K`/boost weights).
+///
+/// **What this does not fix, disclosed rather than hidden:** it only ever
+/// removes a *trailing* suffix of an already-sorted list — it cannot
+/// promote a genuine match that scores *below* unrelated noise, which the
+/// same investigation also observed happening (a real SQL entry ranked
+/// below several unrelated clipboard entries for the query `sql`). That is
+/// a ranking/representation problem, not a padding problem, and is not
+/// solved here. See `ARCHITECTURE_INVARIANTS.md`'s Phase 4 entry.
+const RELEVANCE_MARGIN: f32 = 0.03;
+
+/// Drops the trailing suffix of `hits` (must already be sorted
+/// score-descending, as `EmbeddingStore::nearest()` guarantees) that
+/// falls more than [`RELEVANCE_MARGIN`] below the best score. Never
+/// reorders, never adds — only ever shortens. Pulled out as its own pure
+/// function so the cutoff logic is testable without a real embedding
+/// model.
+fn apply_relevance_margin(hits: Vec<(i64, f32)>) -> Vec<(i64, f32)> {
+    let Some(&(_, top_score)) = hits.first() else {
+        return hits;
+    };
+    let cutoff = top_score - RELEVANCE_MARGIN;
+    hits.into_iter().take_while(|&(_, score)| score >= cutoff).collect()
+}
+
 /// Brute-force cosine search (vectors are pre-normalized, so this is just a
 /// dot product) — see the module doc for why this beats sqlite-vec at this
-/// scale. Returns `(object_id, score)` sorted best-first.
+/// scale. Returns `(object_id, score)` sorted best-first, with the
+/// [`RELEVANCE_MARGIN`] cutoff already applied — callers never have to
+/// filter this themselves, and `EmbeddingStore::nearest()`'s own contract
+/// (an index operation, no relevance judgment) stays unchanged.
 ///
 /// This module owns turning text into a vector; finding the nearest stored
 /// vectors is an index operation and lives behind `EmbeddingStore::nearest`
 /// — the same side of the boundary as an FTS `MATCH`. That split is what
 /// lets the brute-force scan be swapped for an ANN index without any caller
 /// noticing. (Phase 2 had it the other way round and would have had to move
-/// this code anyway.)
+/// this code anyway.) The relevance margin is deliberately layered on top
+/// of that call rather than pushed into `nearest()`/`storage_sqlite.rs`:
+/// "how far is too far from the best match" is a judgment about relevance,
+/// not about finding candidates, and keeping it here means the storage
+/// trait's contract never had to change to fix this.
 pub fn search(
     st: &impl EmbeddingStore,
     object_type: ObjectType,
@@ -275,6 +338,53 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    st.nearest(object_type, &query_vec, limit)
+    Ok(apply_relevance_margin(st.nearest(object_type, &query_vec, limit)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relevant_candidates_within_margin_are_retained() {
+        let hits = vec![(1, 0.90), (2, 0.88), (3, 0.875)];
+        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90), (2, 0.88), (3, 0.875)]);
+    }
+
+    #[test]
+    fn weak_matches_beyond_margin_are_excluded() {
+        let hits = vec![(1, 0.90), (2, 0.85), (3, 0.60), (4, 0.40)];
+        // top=0.90, cutoff=0.87 -> only id 1 survives.
+        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90)]);
+    }
+
+    #[test]
+    fn does_not_force_k_results_when_fewer_are_relevant() {
+        // 1 genuinely close candidate, several distant ones, limit-sized
+        // input (as `nearest()` would hand over) — the whole point of
+        // this fix: the padding must not survive just because the caller
+        // asked for more.
+        let hits: Vec<(i64, f32)> = std::iter::once((1_i64, 0.90_f32))
+            .chain((2..=10).map(|id| (id, 0.5 - id as f32 * 0.01)))
+            .collect();
+        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90)]);
+    }
+
+    #[test]
+    fn empty_input_stays_empty() {
+        assert_eq!(apply_relevance_margin(Vec::new()), Vec::new());
+    }
+
+    #[test]
+    fn relative_order_of_retained_candidates_is_unchanged() {
+        let hits = vec![(3, 0.95), (1, 0.94), (2, 0.93), (9, 0.10)];
+        assert_eq!(apply_relevance_margin(hits), vec![(3, 0.95), (1, 0.94), (2, 0.93)]);
+    }
+
+    #[test]
+    fn ties_at_the_top_are_all_retained() {
+        let hits = vec![(1, 0.90), (2, 0.90), (3, 0.90), (4, 0.10)];
+        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90), (2, 0.90), (3, 0.90)]);
+    }
 }
 
