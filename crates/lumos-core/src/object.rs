@@ -24,7 +24,14 @@ use serde::Serialize;
 /// about: a future `SearchIntent` that wants to filter by *source*
 /// (`object_types: Vec<ObjectType>`) needs a field distinct from whatever
 /// carries `type:jwt`-style filtering, not a reuse of the same name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// `PartialOrd`/`Ord` (derived, in declaration order: `File < Clipboard <
+/// Screenshot < ...`) exist so `ObjectId` — and by extension search
+/// ranking — has a deterministic tie-breaker that doesn't depend on
+/// `HashMap` iteration order or any other runtime/process-specific state.
+/// This ordering carries no domain meaning by itself (File isn't "less
+/// than" Clipboard); it only needs to be *total* and *stable across
+/// processes*, which a derived ordering over a fixed enum declaration is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectType {
     File,
@@ -40,7 +47,11 @@ pub enum ObjectType {
 /// today's storage (Phase 2+) already hands out per-table row ids, and a
 /// composite key lets that continue without forcing a schema change just to
 /// introduce this model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+///
+/// Derived `Ord` (by `object_type` then `local_id`, field declaration
+/// order) is what `search.rs` uses to break ties between equal-score
+/// ranking candidates deterministically — see `search_all`'s final sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ObjectId {
     pub object_type: ObjectType,
     pub local_id: i64,

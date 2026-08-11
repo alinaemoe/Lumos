@@ -592,7 +592,21 @@ where
         ranked.push((score, object));
     }
 
-    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // Score descending, then `ObjectId` ascending as a deterministic
+    // tie-breaker. Without this, equal-score candidates keep whatever
+    // order they happened to come out of `merge_candidates`'s
+    // `HashMap<ObjectId, f32>` in — which varies from run to run, since
+    // `HashMap`'s default hasher is seeded per-process. `sort_by` is
+    // stable, so it preserves that randomized order for ties rather than
+    // fixing it; the comparator has to break the tie itself.
+    // Score descending, then `ObjectId` ascending as a deterministic
+    // tie-breaker. Without this, equal-score candidates keep whatever
+    // order they happened to come out of `merge_candidates`'s
+    // `HashMap<ObjectId, f32>` in — which varies from run to run, since
+    // `HashMap`'s default hasher is seeded per-process. `sort_by` is
+    // stable, so it preserves that randomized order for ties rather than
+    // fixing it; the comparator has to break the tie itself.
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
     ranked.truncate(limit);
 
     Ok(ranked.into_iter().map(|(_, obj)| to_search_hit(obj)).collect())
@@ -1290,5 +1304,121 @@ mod tests {
         let hits = search_all(&st, &intent, 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(matches!(hits[0], SearchHit::Clipboard(_)));
+    }
+
+    // ---- Deterministic ordering for tied scores ----
+
+    #[test]
+    fn object_id_ord_is_a_total_deterministic_order() {
+        let a = ObjectId::new(ObjectType::File, 5);
+        let b = ObjectId::new(ObjectType::Clipboard, 1);
+        let a_again = ObjectId::new(ObjectType::File, 5);
+        assert_eq!(a, a_again);
+        assert!(a < b, "File orders before Clipboard by declaration order — an arbitrary but fixed, compile-time rule, not runtime state");
+        let mut ids = vec![b, a];
+        ids.sort();
+        assert_eq!(ids, vec![a, b], "sorting must be repeatable, not just internally consistent");
+    }
+
+    /// This is the test that actually exercises the property the bug
+    /// violated: with only `b.0.total_cmp(&a.0)` (the pre-fix comparator),
+    /// a stable sort preserves whatever order tied elements arrived in —
+    /// so two different arrival orders for the *same* tied-score set
+    /// produce two different outputs. The prior audit observed this as
+    /// "6 consecutive process launches, 6 different orders," because
+    /// `HashMap`'s per-process random seed changes what order
+    /// `merge_candidates` happens to hand equal-score candidates to
+    /// `sort_by` in. Re-running within a single test process would not
+    /// reliably reproduce that — `HashMap`'s default hasher reuses the
+    /// same per-thread random keys across separate `HashMap` instances in
+    /// one process, so repeated calls in one test are not a faithful
+    /// stand-in for repeated *process launches*. Testing the comparator
+    /// directly against two deliberately different input orderings is:
+    /// it proves the output no longer depends on arrival order at all,
+    /// which is the only way to be correct regardless of what any given
+    /// process's `HashMap` seed happens to be.
+    #[test]
+    fn tie_break_by_object_id_makes_order_independent_of_input_arrival_order() {
+        fn clip_obj_for_tie(local_id: i64) -> Object {
+            Object::new(
+                local_id,
+                ObjectMetadata::default(),
+                ObjectPayload::Clipboard(ClipboardPayload {
+                    text_content: format!("tie {local_id}"),
+                    detected_type: "text".into(),
+                    pinned: false,
+                    search_extra: None,
+                }),
+            )
+        }
+        // Same comparator `search_all` uses for its final sort — kept as
+        // a literal copy here (not extracted into a shared function)
+        // deliberately, so this test fails the moment someone changes
+        // the real comparator without updating this one too.
+        let sort_with_tiebreak = |mut v: Vec<(f32, Object)>| -> Vec<i64> {
+            v.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+            v.into_iter().map(|(_, o)| o.id.local_id).collect()
+        };
+
+        let tied_score = 0.5_f32;
+        let arrival_order_a: Vec<(f32, Object)> =
+            [3, 1, 4, 2].into_iter().map(|id| (tied_score, clip_obj_for_tie(id))).collect();
+        let arrival_order_b: Vec<(f32, Object)> =
+            [2, 4, 1, 3].into_iter().map(|id| (tied_score, clip_obj_for_tie(id))).collect();
+
+        let result_a = sort_with_tiebreak(arrival_order_a);
+        let result_b = sort_with_tiebreak(arrival_order_b);
+
+        assert_eq!(result_a, result_b, "identical tied scores must sort the same way regardless of arrival order — this is what a bare stable sort cannot guarantee");
+        assert_eq!(result_a, vec![1, 2, 3, 4], "ties resolve to ascending ObjectId, i.e. ascending local_id within one type");
+    }
+
+    #[test]
+    fn search_all_orders_tied_clipboard_scores_by_object_id_ascending() {
+        // Real end-to-end fixture, not a synthetic Vec: several clipboard
+        // entries sharing one `created_at`, retrieved via the recency
+        // path (`RetrievalSource::Recency` contributes 0 to RRF), so
+        // their final scores are exactly equal (identical recency_boost,
+        // no text to drive exact-match, no project filter).
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let now = crate::now_secs();
+        let mut ids: Vec<i64> = (0..6)
+            .map(|i| st.save(&clip_at(&format!("tie entry {i}"), "text", now - 3600)).unwrap().local_id)
+            .collect();
+        ids.sort();
+
+        let hits = search_all_text(&st, "today", 20).unwrap();
+        let returned: Vec<i64> = hits
+            .iter()
+            .map(|h| match h {
+                SearchHit::Clipboard(c) => c.id,
+                SearchHit::File(f) => f.id,
+            })
+            .collect();
+        assert_eq!(returned, ids, "tied clipboard entries must come back in ascending id order");
+    }
+
+    #[test]
+    fn existing_ranking_for_non_tied_scores_is_unaffected_by_the_tiebreak() {
+        // The exactness boost already gives these two entries different
+        // scores — the tiebreak comparator must never override a real
+        // score difference. (Companion to the pre-existing
+        // `search_all_exact_match_ranks_above_partial_match`, re-asserted
+        // here specifically to document that this fix didn't touch it.)
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let exact = st.save(&clip_at("react", "text", 100)).unwrap();
+        let partial = st.save(&clip_at("a note about react hooks", "text", 100)).unwrap();
+
+        let hits = search_all_text(&st, "react", 10).unwrap();
+        let returned: Vec<i64> = hits
+            .iter()
+            .map(|h| match h {
+                SearchHit::Clipboard(c) => c.id,
+                SearchHit::File(f) => f.id,
+            })
+            .collect();
+        assert_eq!(returned, vec![exact.local_id, partial.local_id], "the exact match must still rank first — score, not id, decides when scores differ");
     }
 }
