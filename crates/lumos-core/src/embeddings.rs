@@ -291,18 +291,84 @@ pub fn backfill_all(st: &impl EmbeddingStore) -> Result<(usize, usize)> {
 /// solved here. See `ARCHITECTURE_INVARIANTS.md`'s Phase 4 entry.
 const RELEVANCE_MARGIN: f32 = 0.03;
 
-/// Drops the trailing suffix of `hits` (must already be sorted
-/// score-descending, as `EmbeddingStore::nearest()` guarantees) that
-/// falls more than [`RELEVANCE_MARGIN`] below the best score. Never
-/// reorders, never adds — only ever shortens. Pulled out as its own pure
-/// function so the cutoff logic is testable without a real embedding
-/// model.
-fn apply_relevance_margin(hits: Vec<(i64, f32)>) -> Vec<(i64, f32)> {
+/// The fraction of the corpus that may sit within [`RELEVANCE_MARGIN`] of
+/// the top score before the whole ranking is judged uninformative.
+///
+/// **Why concentration, not an absolute score threshold.** Measured on the
+/// real model against the real corpus, these two queries are essentially
+/// indistinguishable by score yet opposite in relevance:
+///
+/// ```text
+/// "jwt"                               top=0.8579  band=652/4953 (13.2%)  -> noise ("jp.png")
+/// "database connection configuration" top=0.8578  band= 56/4953 ( 1.1%)  -> genuine ("IdentityServerConfigurationDbContext.cs")
+/// ```
+///
+/// Their top scores differ by 0.0001. No absolute cutoff can separate
+/// them. What *does* separate them is the shape of the distribution
+/// underneath the top: a genuine match is a sharp peak standing clear of
+/// the corpus, while noise produces a flat plateau where the "best" result
+/// is merely the maximum of a crowd that is all equally (ir)relevant. That
+/// is exactly the signature of embedding anisotropy — absolute cosine
+/// carries little information, but *relative concentration* carries a lot.
+///
+/// Measured separation across both corpora (files n=4953, clipboard n=99),
+/// nine queries spanning short tokens, natural language, identifiers,
+/// paths and a deliberate no-match control:
+///
+/// ```text
+/// genuine relevance: 0.3% 0.4% 0.6% 1.0% 1.1% 1.3% 2.0% 3.0% 3.0%
+/// noise            : 6.6% 13.1% 13.2% 17.8% 25.3% 26.3% 31.3% 37.4%
+/// ```
+///
+/// A clean gap sits between 3.0% and 6.6%; 5% is placed in the middle of
+/// it. Like this crate's other ranking constants this is an empirical
+/// first-pass value, not a tuned optimum — but unlike a bare score
+/// threshold it is measuring a property that actually distinguishes the
+/// two cases.
+const MAX_TOP_BAND_FRACTION: f32 = 0.05;
+
+/// Corpora smaller than this are exempt from the concentration check —
+/// "what fraction sits near the top" is not a meaningful statistic over a
+/// handful of vectors, and applying it there would reject perfectly good
+/// matches purely because the sample is tiny.
+const MIN_CORPUS_FOR_CONCENTRATION: usize = 20;
+
+/// Decides which of `hits` are genuinely relevant. `hits` must already be
+/// sorted score-descending (as `EmbeddingStore::nearest` guarantees), and
+/// `corpus_size` is the total number of vectors of this type.
+///
+/// Two independent rules, in order:
+///
+/// 1. **Concentration.** If more than [`MAX_TOP_BAND_FRACTION`] of the
+///    corpus falls within [`RELEVANCE_MARGIN`] of the top score, the top
+///    is not a genuine outlier — it is the maximum of a flat distribution.
+///    The entire list is rejected. Returning nothing is the correct answer
+///    for a query with no real match; padding it with the least-bad noise
+///    is not.
+/// 2. **Margin.** Otherwise, keep the leading run within
+///    [`RELEVANCE_MARGIN`] of the top and drop the trailing tail.
+///
+/// Never reorders and never adds — only ever shortens. Pure, so the whole
+/// judgment is testable without a real embedding model.
+///
+/// `hits` may be a truncated sample rather than the full corpus; the band
+/// count is therefore a lower bound, which is sufficient because the rule
+/// only needs to detect *exceeding* the threshold. `search` sizes its
+/// sample so that a band filling the entire sample already exceeds it.
+fn filter_by_relevance(hits: Vec<(i64, f32)>, corpus_size: usize) -> Vec<(i64, f32)> {
     let Some(&(_, top_score)) = hits.first() else {
         return hits;
     };
     let cutoff = top_score - RELEVANCE_MARGIN;
-    hits.into_iter().take_while(|&(_, score)| score >= cutoff).collect()
+    let band = hits.iter().take_while(|&&(_, score)| score >= cutoff).count();
+
+    if corpus_size >= MIN_CORPUS_FOR_CONCENTRATION
+        && band as f32 > corpus_size as f32 * MAX_TOP_BAND_FRACTION
+    {
+        return Vec::new();
+    }
+
+    hits.into_iter().take(band).collect()
 }
 
 /// Brute-force cosine search (vectors are pre-normalized, so this is just a
@@ -338,53 +404,151 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    Ok(apply_relevance_margin(st.nearest(object_type, &query_vec, limit)?))
+    // Fetch enough candidates to *judge* the distribution, not just enough
+    // to return. The concentration rule needs to detect a band wider than
+    // `MAX_TOP_BAND_FRACTION` of the corpus, so the sample is sized one
+    // past that threshold: if every candidate in the sample sits inside
+    // the margin, the real band already exceeds what's allowed and the
+    // list is rejected without needing its exact size. Cheap in practice —
+    // `nearest` already scores the whole corpus regardless of `limit`, so
+    // this only widens the sort/truncate, not the scan.
+    let corpus_size = st.vector_count(object_type)?;
+    let allowed_band = (corpus_size as f32 * MAX_TOP_BAND_FRACTION).ceil() as usize;
+    let sample_n = limit.max(allowed_band.saturating_add(1));
+
+    let hits = st.nearest(object_type, &query_vec, sample_n)?;
+    let mut relevant = filter_by_relevance(hits, corpus_size);
+    relevant.truncate(limit);
+    Ok(relevant)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Corpus big enough that the concentration rule is active, used
+    /// wherever a test isn't specifically about the small-corpus exemption.
+    const BIG: usize = 1000;
+
     #[test]
     fn relevant_candidates_within_margin_are_retained() {
         let hits = vec![(1, 0.90), (2, 0.88), (3, 0.875)];
-        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90), (2, 0.88), (3, 0.875)]);
+        assert_eq!(
+            filter_by_relevance(hits, BIG),
+            vec![(1, 0.90), (2, 0.88), (3, 0.875)]
+        );
     }
 
     #[test]
     fn weak_matches_beyond_margin_are_excluded() {
         let hits = vec![(1, 0.90), (2, 0.85), (3, 0.60), (4, 0.40)];
-        // top=0.90, cutoff=0.87 -> only id 1 survives.
-        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90)]);
+        // top=0.90, cutoff=0.87 -> only id 1 is inside the margin.
+        assert_eq!(filter_by_relevance(hits, BIG), vec![(1, 0.90)]);
     }
 
     #[test]
     fn does_not_force_k_results_when_fewer_are_relevant() {
-        // 1 genuinely close candidate, several distant ones, limit-sized
-        // input (as `nearest()` would hand over) — the whole point of
-        // this fix: the padding must not survive just because the caller
-        // asked for more.
         let hits: Vec<(i64, f32)> = std::iter::once((1_i64, 0.90_f32))
             .chain((2..=10).map(|id| (id, 0.5 - id as f32 * 0.01)))
             .collect();
-        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90)]);
+        assert_eq!(filter_by_relevance(hits, BIG), vec![(1, 0.90)]);
     }
 
     #[test]
     fn empty_input_stays_empty() {
-        assert_eq!(apply_relevance_margin(Vec::new()), Vec::new());
+        assert_eq!(filter_by_relevance(Vec::new(), BIG), Vec::new());
     }
 
     #[test]
     fn relative_order_of_retained_candidates_is_unchanged() {
         let hits = vec![(3, 0.95), (1, 0.94), (2, 0.93), (9, 0.10)];
-        assert_eq!(apply_relevance_margin(hits), vec![(3, 0.95), (1, 0.94), (2, 0.93)]);
+        assert_eq!(
+            filter_by_relevance(hits, BIG),
+            vec![(3, 0.95), (1, 0.94), (2, 0.93)]
+        );
     }
 
     #[test]
     fn ties_at_the_top_are_all_retained() {
         let hits = vec![(1, 0.90), (2, 0.90), (3, 0.90), (4, 0.10)];
-        assert_eq!(apply_relevance_margin(hits), vec![(1, 0.90), (2, 0.90), (3, 0.90)]);
+        assert_eq!(
+            filter_by_relevance(hits, BIG),
+            vec![(1, 0.90), (2, 0.90), (3, 0.90)]
+        );
+    }
+
+    // ---- Concentration rule: the ranking-inversion fix ----
+
+    /// The measured `"jwt"` reproduction, reduced to its numbers: a large
+    /// corpus where a big fraction of it clusters within the margin of the
+    /// top. The old margin-only logic returned the whole plateau (and with
+    /// it `NotificationsTable.jsx`); the concentration rule rejects the
+    /// list outright. This test fails against the pre-fix implementation.
+    #[test]
+    fn flat_distribution_is_rejected_entirely_as_uninformative() {
+        // 200 candidates all within 0.03 of each other, corpus 1000 ->
+        // 20% band, far past the 5% allowance.
+        let hits: Vec<(i64, f32)> = (0..200).map(|i| (i, 0.858 - i as f32 * 0.0001)).collect();
+        assert_eq!(
+            filter_by_relevance(hits, 1000),
+            Vec::new(),
+            "a top score that is merely the maximum of a flat crowd is not a match"
+        );
+    }
+
+    /// The measured `"database connection configuration"` case: virtually
+    /// the same top score as the `jwt` noise case above (0.8578 vs 0.8579
+    /// in the real measurement), but a sharp peak instead of a plateau.
+    /// Score alone cannot tell these apart — concentration can.
+    #[test]
+    fn sharp_peak_is_kept_even_at_the_same_top_score_as_a_rejected_flat_one() {
+        let hits: Vec<(i64, f32)> = (0..11).map(|i| (i, 0.8578 - i as f32 * 0.0025)).collect();
+        let kept = filter_by_relevance(hits, 1000);
+        assert!(!kept.is_empty(), "a genuine outlier must survive");
+        assert_eq!(kept[0].0, 0);
+        assert!(kept.len() <= 13, "only the peak, not a plateau");
+    }
+
+    #[test]
+    fn small_corpora_are_exempt_from_the_concentration_rule() {
+        // 3 of 4 vectors within the margin is 75% — way past the fraction
+        // — but 4 vectors is far too few to infer a distribution from.
+        let hits = vec![(1, 0.90), (2, 0.895), (3, 0.89)];
+        assert_eq!(
+            filter_by_relevance(hits, 4),
+            vec![(1, 0.90), (2, 0.895), (3, 0.89)]
+        );
+    }
+
+    #[test]
+    fn concentration_rule_is_scale_relative_not_absolute() {
+        // Identical hit list, identical scores; only the corpus size
+        // differs. Proves the decision is about *fraction of corpus*, not
+        // about any hardcoded score value — i.e. it cannot be
+        // keyword- or magnitude-specific.
+        let hits: Vec<(i64, f32)> = (0..30).map(|i| (i, 0.90 - i as f32 * 0.0005)).collect();
+        assert!(
+            filter_by_relevance(hits.clone(), 100).is_empty(),
+            "30 of 100 is 30% — a plateau"
+        );
+        assert_eq!(
+            filter_by_relevance(hits, 10_000).len(),
+            30,
+            "the same 30 out of 10000 is 0.3% — a genuine peak"
+        );
+    }
+
+    #[test]
+    fn identical_scores_are_judged_only_by_concentration_never_by_magnitude() {
+        // Same top score (0.99, very "high"), same shape, two corpus
+        // sizes. A high absolute score does not rescue a plateau, and a
+        // low one does not condemn a peak — there is no magnitude test
+        // anywhere in the rule.
+        let plateau: Vec<(i64, f32)> = (0..40).map(|i| (i, 0.99 - i as f32 * 0.0001)).collect();
+        assert!(filter_by_relevance(plateau, 200).is_empty());
+
+        let low_peak = vec![(1_i64, 0.31_f32), (2, 0.30)];
+        assert_eq!(filter_by_relevance(low_peak, 200).len(), 2);
     }
 }
 

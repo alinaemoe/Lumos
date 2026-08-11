@@ -522,6 +522,18 @@ impl EmbeddingStore for SqliteStore<'_> {
         Ok(scored)
     }
 
+    fn vector_count(&self, object_type: ObjectType) -> Result<usize> {
+        let Some(tag) = type_tag(object_type) else {
+            return Ok(0);
+        };
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM embeddings WHERE object_type = ?1",
+            [tag],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
     fn pending_embeddings(
         &self,
         object_type: ObjectType,

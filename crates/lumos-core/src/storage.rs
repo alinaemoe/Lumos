@@ -267,6 +267,17 @@ pub trait EmbeddingStore {
         limit: usize,
     ) -> Result<Vec<(i64, f32)>>;
 
+    /// How many vectors of this type are stored.
+    ///
+    /// Needed by the domain's relevance judgment: deciding whether a
+    /// query's top similarity score is a genuine outlier or merely the
+    /// maximum of a flat, uninformative distribution requires knowing what
+    /// fraction of the corpus sits near that top — which needs the corpus
+    /// size as a denominator. Counting rows is a storage question, not a
+    /// relevance judgment, so it belongs here; the judgment itself stays in
+    /// `embeddings.rs`.
+    fn vector_count(&self, object_type: ObjectType) -> Result<usize>;
+
     /// Objects of this type that have no vector yet, paired with the text
     /// to embed. `limit` caps the batch; `usize::MAX` means "all".
     ///
