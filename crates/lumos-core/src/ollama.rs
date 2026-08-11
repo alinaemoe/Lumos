@@ -43,6 +43,7 @@ use crate::intent_schema::{SourceName, TimeToken, SCHEMA_VERSION};
 use crate::interpreter::SchemaInterpreter;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Where to find Ollama and which model to ask. Defaults match
@@ -72,17 +73,39 @@ impl Default for OllamaConfig {
     }
 }
 
-/// Transport-only [`SchemaInterpreter`]. Holds configuration and nothing
-/// else — no cached connection, no state carried between calls, matching
-/// `intent_schema.rs`'s own "pure functions, no hidden state" shape.
+/// Transport-only [`SchemaInterpreter`], plus one bit of process-lifetime
+/// state: whether a *transport-level* failure (connection refused, DNS
+/// failure, timeout establishing/completing the connection) has already
+/// been observed. See [`generate`](SchemaInterpreter::generate)'s doc
+/// comment below for why only that failure class sets it, and
+/// `ARCHITECTURE_INVARIANTS.md`'s Phase 5.5 entry for the reasoning this
+/// design is based on.
+///
+/// One `OllamaInterpreter` is constructed once per process (CLI: in
+/// `main()`; app: once in `setup()`, held in Tauri-managed state), so
+/// "process-lifetime" and "this struct's lifetime" are the same span in
+/// practice — the flag needs no explicit reset path, because a new process
+/// means a new instance means `unavailable` starts at `false` again.
 pub struct OllamaInterpreter {
     config: OllamaConfig,
+    unavailable: AtomicBool,
 }
 
 impl OllamaInterpreter {
     pub fn new(config: OllamaConfig) -> Self {
-        Self { config }
+        Self { config, unavailable: AtomicBool::new(false) }
     }
+}
+
+/// A *transport*-level failure — no HTTP response was ever received
+/// (connection refused, DNS failure, TLS failure, the connect/read/write
+/// timing out). Distinct from [`ureq::Error::Status`], which means Ollama
+/// **did** answer, just with a non-2xx status — that is "available, but
+/// something else is wrong," not "unavailable," and must not trip the same
+/// flag (Phase 5.5 requirement D: a live-but-misbehaving server is not the
+/// same fact as an absent one).
+fn is_transport_failure(error: &ureq::Error) -> bool {
+    matches!(error, ureq::Error::Transport(_))
 }
 
 /// The subset of Ollama's `/api/generate` response this client reads.
@@ -157,7 +180,19 @@ impl SchemaInterpreter for OllamaInterpreter {
     /// here inspects the *content* of that text (no JSON-schema check, no
     /// field check) — that is `intent_schema::parse_schema_json`'s job,
     /// invoked by `interpreter::interpret`, never by this function.
+    ///
+    /// Phase 5.5: skips the network call entirely once a transport-level
+    /// failure has already been observed this process — see the struct's
+    /// own doc comment. This is the one and only place that check happens;
+    /// every other failure mode (bad status, malformed body, empty
+    /// content) still runs the request fresh every time, because those say
+    /// nothing about whether Ollama is *reachable*, only about what it said
+    /// once reached.
     fn generate(&self, query: &str) -> Result<String> {
+        if self.unavailable.load(Ordering::Relaxed) {
+            bail!("ollama was found unreachable earlier this session — skipping connection attempt");
+        }
+
         let base = self.config.base_url.trim_end_matches('/');
         let url = format!("{base}/api/generate");
         let body = OllamaGenerateRequest {
@@ -170,10 +205,15 @@ impl SchemaInterpreter for OllamaInterpreter {
             stream: false,
         };
 
-        let response = ureq::post(&url)
-            .timeout(self.config.timeout)
-            .send_json(&body)
-            .map_err(|e| anyhow!("ollama request to {url} failed: {e}"))?;
+        let response = match ureq::post(&url).timeout(self.config.timeout).send_json(&body) {
+            Ok(response) => response,
+            Err(e) => {
+                if is_transport_failure(&e) {
+                    self.unavailable.store(true, Ordering::Relaxed);
+                }
+                return Err(anyhow!("ollama request to {url} failed: {e}"));
+            }
+        };
 
         let parsed: OllamaGenerateResponse = response
             .into_json()
@@ -196,27 +236,40 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    /// A minimal loopback HTTP/1.1 server: accepts one connection, records
-    /// the raw request bytes it received, writes back a fixed response,
-    /// then closes. Not a general-purpose mock — just enough of HTTP to
-    /// exercise `ureq`'s client path deterministically and offline, since
-    /// the repository has no existing HTTP-mocking dependency and this step
-    /// is instructed not to add one solely for this test.
+    /// A minimal loopback HTTP/1.1 server: accepts up to `responses.len()`
+    /// connections in order, records the raw request bytes each one sent,
+    /// writes back the corresponding canned response, then moves to the
+    /// next. Not a general-purpose mock — just enough of HTTP to exercise
+    /// `ureq`'s client path deterministically and offline, since the
+    /// repository has no existing HTTP-mocking dependency and this step is
+    /// instructed not to add one solely for this test.
+    ///
+    /// `accepted_count()` is what Phase 5.5's tests assert on instead of
+    /// timing: how many real connections actually reached the server,
+    /// which is the direct, non-flaky observation of "did the client skip
+    /// the network or not."
     struct MockServer {
         base_url: String,
-        received: Arc<Mutex<Option<String>>>,
+        received: Arc<Mutex<Vec<String>>>,
+        accepted: Arc<std::sync::atomic::AtomicUsize>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
     impl MockServer {
-        /// `respond_after` lets the timeout test simulate a slow Ollama.
-        fn start(response: Vec<u8>, respond_after: Duration) -> Self {
+        /// `respond_after` lets the timeout test simulate a slow Ollama —
+        /// applied uniformly before every response, since no current test
+        /// needs a different delay per response.
+        fn start(responses: Vec<Vec<u8>>, respond_after: Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let base_url = format!("http://{}", listener.local_addr().unwrap());
-            let received = Arc::new(Mutex::new(None));
+            let received = Arc::new(Mutex::new(Vec::new()));
             let received_clone = received.clone();
+            let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let accepted_clone = accepted.clone();
             let handle = thread::spawn(move || {
-                if let Ok((mut stream, _)) = listener.accept() {
+                for response in responses {
+                    let Ok((mut stream, _)) = listener.accept() else { break };
+                    accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
                     // Read until the client stops sending (0.5s of silence,
                     // via the read timeout above, or a closed connection) —
@@ -232,12 +285,12 @@ mod tests {
                             Err(_) => break,
                         }
                     }
-                    *received_clone.lock().unwrap() = Some(String::from_utf8_lossy(&buf).to_string());
+                    received_clone.lock().unwrap().push(String::from_utf8_lossy(&buf).to_string());
                     thread::sleep(respond_after);
                     let _ = stream.write_all(&response);
                 }
             });
-            Self { base_url, received, handle: Some(handle) }
+            Self { base_url, received, accepted, handle: Some(handle) }
         }
 
         fn join(&mut self) {
@@ -246,8 +299,14 @@ mod tests {
             }
         }
 
+        /// The most recently received request — the one existing
+        /// single-response tests care about.
         fn request_text(&self) -> String {
-            self.received.lock().unwrap().clone().unwrap_or_default()
+            self.received.lock().unwrap().last().cloned().unwrap_or_default()
+        }
+
+        fn accepted_count(&self) -> usize {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -275,7 +334,7 @@ mod tests {
 
     #[test]
     fn successful_response_returns_generated_text() {
-        let mut server = MockServer::start(http_ok(r#"{"response":"{\"version\":1}","done":true}"#), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_ok(r#"{"response":"{\"version\":1}","done":true}"#)], Duration::ZERO);
         let client = OllamaInterpreter::new(config_for(&server.base_url));
 
         let text = client.generate("find my jwt").unwrap();
@@ -285,7 +344,7 @@ mod tests {
 
     #[test]
     fn http_error_status_returns_err() {
-        let mut server = MockServer::start(http_status(500, "Internal Server Error", r#"{"error":"boom"}"#), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_status(500, "Internal Server Error", r#"{"error":"boom"}"#)], Duration::ZERO);
         let client = OllamaInterpreter::new(config_for(&server.base_url));
 
         assert!(client.generate("q").is_err());
@@ -306,7 +365,7 @@ mod tests {
 
     #[test]
     fn malformed_json_body_returns_err() {
-        let mut server = MockServer::start(http_ok("not json at all"), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_ok("not json at all")], Duration::ZERO);
         let client = OllamaInterpreter::new(config_for(&server.base_url));
 
         assert!(client.generate("q").is_err());
@@ -315,7 +374,7 @@ mod tests {
 
     #[test]
     fn empty_generated_content_returns_err() {
-        let mut server = MockServer::start(http_ok(r#"{"response":""}"#), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_ok(r#"{"response":""}"#)], Duration::ZERO);
         let client = OllamaInterpreter::new(config_for(&server.base_url));
 
         assert!(client.generate("q").is_err());
@@ -324,7 +383,7 @@ mod tests {
 
     #[test]
     fn missing_response_field_returns_err() {
-        let mut server = MockServer::start(http_ok(r#"{"done":true}"#), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_ok(r#"{"done":true}"#)], Duration::ZERO);
         let client = OllamaInterpreter::new(config_for(&server.base_url));
 
         assert!(client.generate("q").is_err());
@@ -336,7 +395,7 @@ mod tests {
         // Server deliberately responds well after the client's configured
         // timeout — this is the "Ollama hung / is overloaded" case, not
         // "Ollama is down."
-        let mut server = MockServer::start(http_ok(r#"{"response":"{}"}"#), Duration::from_secs(3));
+        let mut server = MockServer::start(vec![http_ok(r#"{"response":"{}"}"#)], Duration::from_secs(3));
         let mut config = config_for(&server.base_url);
         config.timeout = Duration::from_millis(200);
         let client = OllamaInterpreter::new(config);
@@ -347,7 +406,7 @@ mod tests {
 
     #[test]
     fn request_targets_configured_model() {
-        let mut server = MockServer::start(http_ok(r#"{"response":"{\"version\":1}"}"#), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_ok(r#"{"response":"{\"version\":1}"}"#)], Duration::ZERO);
         let client = OllamaInterpreter::new(config_for(&server.base_url));
         client.generate("q").unwrap();
 
@@ -357,7 +416,7 @@ mod tests {
 
     #[test]
     fn request_declares_json_format() {
-        let mut server = MockServer::start(http_ok(r#"{"response":"{\"version\":1}"}"#), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_ok(r#"{"response":"{\"version\":1}"}"#)], Duration::ZERO);
         let client = OllamaInterpreter::new(config_for(&server.base_url));
         client.generate("q").unwrap();
 
@@ -370,7 +429,7 @@ mod tests {
         // The mock server's address is a fresh, randomly assigned loopback
         // port each run; the request reaching it at all (rather than some
         // hardcoded default) proves `base_url` is actually respected.
-        let mut server = MockServer::start(http_ok(r#"{"response":"{\"version\":1}"}"#), Duration::ZERO);
+        let mut server = MockServer::start(vec![http_ok(r#"{"response":"{\"version\":1}"}"#)], Duration::ZERO);
         let host_header = server.base_url.trim_start_matches("http://").to_string();
         let client = OllamaInterpreter::new(config_for(&server.base_url));
         client.generate("q").unwrap();
@@ -379,6 +438,160 @@ mod tests {
         let req = server.request_text();
         assert!(req.contains("POST /api/generate"));
         assert!(req.contains(&host_header), "request must be addressed to the configured base_url's host:port");
+    }
+
+    // ---- Phase 5.5: process-lifetime availability state ----
+
+    /// Accepts up to `max_connections`, incrementing `accepted` on each one
+    /// and immediately dropping the stream without reading or writing
+    /// anything — an abrupt close, which `ureq` observes as a transport
+    /// failure client-side, the same failure class as connection-refused.
+    /// Lets a test *count* transport-level attempts, which plain
+    /// bind-then-drop (used by `connection_refused_returns_err`) cannot,
+    /// since nothing is listening there to count with.
+    fn abrupt_close_server(max_connections: usize) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_clone = accepted.clone();
+        thread::spawn(move || {
+            for _ in 0..max_connections {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (base_url, accepted)
+    }
+
+    #[test]
+    fn first_connection_failure_falls_back() {
+        let (base_url, _accepted) = abrupt_close_server(1);
+        let client = OllamaInterpreter::new(config_for(&base_url));
+        assert!(client.generate("q").is_err());
+    }
+
+    #[test]
+    fn second_query_after_connection_failure_makes_no_further_http_attempt() {
+        let (base_url, accepted) = abrupt_close_server(3); // generous cap; a correct client only ever uses 1
+        let client = OllamaInterpreter::new(config_for(&base_url));
+
+        assert!(client.generate("first query").is_err());
+        // Give the server thread a moment to register the one connection
+        // it should see before asserting on the count.
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "first call must attempt exactly one connection");
+
+        assert!(client.generate("second query").is_err());
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second call must skip the network entirely once marked unavailable — no second connection attempt"
+        );
+    }
+
+    #[test]
+    fn a_later_success_after_marking_unavailable_is_still_never_attempted() {
+        // Documents the accepted limitation, not a bug: once this process
+        // has seen a transport failure, it never re-checks Ollama again,
+        // even if Ollama comes back up mid-process. Explicitly no
+        // background polling/retry per this step's constraints — the flag
+        // is one-way for the lifetime of the `OllamaInterpreter` instance.
+        let (base_url, accepted) = abrupt_close_server(1);
+        let client = OllamaInterpreter::new(config_for(&base_url));
+
+        assert!(client.generate("q1").is_err());
+        thread::sleep(Duration::from_millis(150));
+        // A real Ollama could now be "up" at this address for all this
+        // client knows — it must not care, by design.
+        assert!(client.generate("q2").is_err());
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_ollama_remains_usable_across_multiple_queries() {
+        let mut server = MockServer::start(
+            vec![
+                http_ok(r#"{"response":"{\"version\":1,\"text\":\"one\"}"}"#),
+                http_ok(r#"{"response":"{\"version\":1,\"text\":\"two\"}"}"#),
+            ],
+            Duration::ZERO,
+        );
+        let client = OllamaInterpreter::new(config_for(&server.base_url));
+
+        assert_eq!(client.generate("first").unwrap(), r#"{"version":1,"text":"one"}"#);
+        assert_eq!(client.generate("second").unwrap(), r#"{"version":1,"text":"two"}"#);
+        server.join();
+        assert_eq!(server.accepted_count(), 2, "a healthy Ollama must be asked again every query, never short-circuited");
+    }
+
+    #[test]
+    fn malformed_json_response_does_not_mark_ollama_unavailable() {
+        // Requirement D, case 2: the server answered — it just answered
+        // with garbage. That is not the same fact as "unreachable," and
+        // must not skip the next attempt.
+        let mut server = MockServer::start(
+            vec![http_ok("not json at all"), http_ok(r#"{"response":"{\"version\":1}"}"#)],
+            Duration::ZERO,
+        );
+        let client = OllamaInterpreter::new(config_for(&server.base_url));
+
+        assert!(client.generate("first").is_err(), "malformed body must still surface as an error");
+        let second = client.generate("second").unwrap();
+        assert_eq!(second, r#"{"version":1}"#, "a later well-formed response must still be attempted and used");
+        server.join();
+        assert_eq!(server.accepted_count(), 2, "malformed content must not have set the unavailable flag");
+    }
+
+    #[test]
+    fn http_error_status_does_not_mark_ollama_unavailable() {
+        // Requirement D, case 2 again, via a non-2xx status rather than a
+        // malformed body: the server is alive and answering HTTP, which is
+        // a fundamentally different fact from "nothing is listening."
+        let mut server = MockServer::start(
+            vec![
+                http_status(500, "Internal Server Error", r#"{"error":"boom"}"#),
+                http_ok(r#"{"response":"{\"version\":1}"}"#),
+            ],
+            Duration::ZERO,
+        );
+        let client = OllamaInterpreter::new(config_for(&server.base_url));
+
+        assert!(client.generate("first").is_err());
+        let second = client.generate("second").unwrap();
+        assert_eq!(second, r#"{"version":1}"#);
+        server.join();
+        assert_eq!(server.accepted_count(), 2, "a bad HTTP status must not have set the unavailable flag either");
+    }
+
+    #[test]
+    fn explicit_none_interpreter_makes_zero_http_attempts() {
+        // Models what `--no-llm` / `LUMOS_LLM=off` produce at the CLI/app
+        // boundary: `schema_interpreter: None`. A live server exists here
+        // specifically so the test can prove it is never touched, rather
+        // than trusting "well, `None` obviously can't call `generate`" by
+        // inspection alone.
+        let mut server = MockServer::start(vec![http_ok(r#"{"response":"{\"version\":1}"}"#)], Duration::ZERO);
+        let no_projects = |_: &str| None;
+
+        let intent = interpret(None, "type:jwt", crate::now_secs(), &no_projects);
+
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(server.accepted_count(), 0, "an explicitly disabled interpreter must never make an HTTP request");
+        assert_eq!(intent, crate::search::parse_intent("type:jwt"));
+
+        // Unblock the server thread's pending accept() so it exits
+        // cleanly instead of leaking a blocked thread for the rest of the
+        // test binary's run.
+        let _ = std::net::TcpStream::connect(server.base_url.trim_start_matches("http://"));
+        server.join();
     }
 
     #[test]

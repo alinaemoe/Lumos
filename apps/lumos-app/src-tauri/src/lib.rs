@@ -414,3 +414,61 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests mutate real process environment variables. Harmless
+    // today (this is the only test module in this crate), but the reason
+    // each test clears every `LUMOS_*` var it touches — including ones it
+    // didn't set — is to stay correct if a sibling test is ever added
+    // rather than relying on there being only one test file forever.
+
+    #[test]
+    fn llm_off_disables_the_interpreter_entirely() {
+        std::env::set_var("LUMOS_LLM", "off");
+        let config = ollama_config_from_env();
+        std::env::remove_var("LUMOS_LLM");
+
+        // `OllamaState(None)` is exactly what makes `search_files` call
+        // `interpreter::search_all_interpreted` with `schema_interpreter:
+        // None` — and `interpret(None, ...)` is proven, in
+        // `ollama::tests::explicit_none_interpreter_makes_zero_http_attempts`,
+        // to never call `SchemaInterpreter::generate` at all. This test
+        // covers the one link in that chain that lives in this crate: the
+        // env var actually produces `None`.
+        assert!(config.is_none(), "LUMOS_LLM=off must produce no OllamaConfig");
+    }
+
+    #[test]
+    fn default_env_produces_a_config_with_the_documented_defaults() {
+        std::env::remove_var("LUMOS_LLM");
+        std::env::remove_var("LUMOS_OLLAMA_URL");
+        std::env::remove_var("LUMOS_OLLAMA_MODEL");
+        std::env::remove_var("LUMOS_OLLAMA_TIMEOUT_MS");
+
+        let config = ollama_config_from_env().expect("no LUMOS_LLM=off set, so a config must be produced");
+        assert_eq!(config.base_url, "http://localhost:11434");
+        assert_eq!(config.model, "qwen3:4b");
+    }
+
+    #[test]
+    fn env_vars_override_the_defaults() {
+        std::env::remove_var("LUMOS_LLM");
+        std::env::set_var("LUMOS_OLLAMA_URL", "http://localhost:9999");
+        std::env::set_var("LUMOS_OLLAMA_MODEL", "custom-model");
+        std::env::set_var("LUMOS_OLLAMA_TIMEOUT_MS", "5000");
+
+        let config = ollama_config_from_env();
+
+        std::env::remove_var("LUMOS_OLLAMA_URL");
+        std::env::remove_var("LUMOS_OLLAMA_MODEL");
+        std::env::remove_var("LUMOS_OLLAMA_TIMEOUT_MS");
+
+        let config = config.unwrap();
+        assert_eq!(config.base_url, "http://localhost:9999");
+        assert_eq!(config.model, "custom-model");
+        assert_eq!(config.timeout, Duration::from_millis(5000));
+    }
+}
