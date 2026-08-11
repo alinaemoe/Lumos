@@ -46,7 +46,8 @@
 //! guess built from an invalid response.
 
 use crate::intent_schema;
-use crate::search::{self, SearchIntent};
+use crate::search::{self, SearchHit, SearchIntent};
+use crate::storage::{EmbeddingStore, FullTextIndex, ObjectStore, ProjectStore};
 use anyhow::Result;
 
 /// Produces raw model output for a query — the entire LLM-facing surface.
@@ -89,6 +90,42 @@ pub fn interpret(
         }
     }
     search::parse_intent(query)
+}
+
+/// Phase 5.4's wiring point: the smallest composition of already-existing,
+/// already-tested pieces that gets a raw CLI/app query through the
+/// interpreter boundary and into the real search engine.
+///
+/// ```text
+/// raw_query -> interpret(schema_interpreter, ..., resolve_project) -> SearchIntent -> search_all
+/// ```
+///
+/// Deliberately *not* a new abstraction: [`interpret`] and
+/// [`search::search_all`] are both untouched by this function, called in
+/// sequence. `resolve_project` is built here from
+/// [`ProjectStore::find_project_by_name`] — the read-only lookup, never
+/// [`ProjectStore::get_or_create_project`] — so an LLM-supplied project name
+/// that doesn't match anything degrades to "no project filter" rather than
+/// creating a project as a side effect of a wrong guess.
+///
+/// [`search::search_all_text`] is untouched by this addition and keeps
+/// meaning exactly what it always has: raw query straight through
+/// [`search::parse_intent`], no interpreter involved. Callers that want the
+/// old, purely-deterministic behavior keep calling that function; callers
+/// that want the interpreter (with its own built-in deterministic fallback)
+/// call this one instead. Neither wraps the other.
+pub fn search_all_interpreted<S>(
+    store: &S,
+    schema_interpreter: Option<&dyn SchemaInterpreter>,
+    raw_query: &str,
+    limit: i64,
+) -> Result<Vec<SearchHit>>
+where
+    S: FullTextIndex + EmbeddingStore + ObjectStore + ProjectStore,
+{
+    let resolve_project = |name: &str| store.find_project_by_name(name).ok().flatten();
+    let intent = interpret(schema_interpreter, raw_query, crate::now_secs(), &resolve_project);
+    search::search_all(store, &intent, limit)
 }
 
 #[cfg(test)]
@@ -191,5 +228,116 @@ mod tests {
         let intent = interpret(Some(&llm), "q", 1_000_000, &no_projects);
         assert_eq!(intent.project_id, None);
         assert!(!intent.object_types.is_empty());
+    }
+
+    // ---- Phase 5.4: search_all_interpreted (interpret + search_all composed) ----
+
+    mod search_all_interpreted_tests {
+        use super::*;
+        use crate::object::{ClipboardPayload, ObjectMetadata, ObjectPayload};
+        use crate::storage::{NewObject, ProjectStore};
+        use crate::storage_sqlite::SqliteStore;
+
+        fn store_conn() -> rusqlite::Connection {
+            crate::db::open_in_memory().unwrap()
+        }
+
+        fn clip_at(text: &str, detected_type: &str, created_at: i64) -> NewObject {
+            NewObject::new(
+                ObjectMetadata { created_at: Some(created_at), updated_at: None, project_id: None, source: None },
+                ObjectPayload::Clipboard(ClipboardPayload {
+                    text_content: text.into(),
+                    detected_type: detected_type.into(),
+                    pinned: false,
+                    search_extra: None,
+                }),
+            )
+        }
+
+        #[test]
+        fn no_interpreter_reaches_search_all_via_deterministic_parser() {
+            let conn = store_conn();
+            let st = SqliteStore::new(&conn);
+            st.save(&clip_at("hydration failed in react", "text", 100)).unwrap();
+
+            let hits = search_all_interpreted(&st, None, "hydration", 10).unwrap();
+            assert_eq!(hits.len(), 1, "with no interpreter configured, this must behave exactly like search_all_text");
+        }
+
+        #[test]
+        fn valid_llm_output_reaches_search_all() {
+            let conn = store_conn();
+            let st = SqliteStore::new(&conn);
+            st.save(&clip_at("eyJ.eyJ.sig", "jwt", 100)).unwrap();
+            st.save(&clip_at("SELECT 1", "sql", 100)).unwrap();
+
+            // Deliberately a query string the deterministic parser would
+            // treat as plain free text with no filter — only a real
+            // schema-aware interpreter path could produce this result.
+            let llm = Fixed(r#"{"version":1,"sources":["clipboard"],"content_kind":"jwt"}"#);
+            let hits = search_all_interpreted(&st, Some(&llm), "find my token thing", 10).unwrap();
+
+            assert_eq!(hits.len(), 1);
+            match &hits[0] {
+                SearchHit::Clipboard(c) => assert_eq!(c.detected_type, "jwt"),
+                _ => panic!("expected clipboard"),
+            }
+        }
+
+        #[test]
+        fn ollama_style_failure_falls_back_to_the_same_result_as_no_interpreter() {
+            let conn = store_conn();
+            let st = SqliteStore::new(&conn);
+            st.save(&clip_at("eyJ.eyJ.sig", "jwt", 100)).unwrap();
+            st.save(&clip_at("SELECT 1", "sql", 100)).unwrap();
+
+            let via_failure = search_all_interpreted(&st, Some(&Failing), "type:jwt", 10).unwrap();
+            let via_none = search_all_interpreted(&st, None, "type:jwt", 10).unwrap();
+
+            assert_eq!(via_failure.len(), via_none.len());
+            assert_eq!(via_failure.len(), 1, "type:jwt must still resolve via the deterministic fallback");
+        }
+
+        #[test]
+        fn malformed_llm_output_falls_back_rather_than_erroring() {
+            let conn = store_conn();
+            let st = SqliteStore::new(&conn);
+            st.save(&clip_at("eyJ.eyJ.sig", "jwt", 100)).unwrap();
+
+            let llm = Fixed("<<not json>>");
+            let hits = search_all_interpreted(&st, Some(&llm), "type:jwt", 10).unwrap();
+            assert_eq!(hits.len(), 1, "malformed model output must fall back to the deterministic parser, not fail the search");
+        }
+
+        #[test]
+        fn known_project_name_from_llm_resolves_via_the_readonly_lookup() {
+            let conn = store_conn();
+            let st = SqliteStore::new(&conn);
+            let project_id = st.get_or_create_project("CCM").unwrap();
+            let mut tagged = clip_at("ccm meeting notes", "text", 100);
+            tagged.metadata.project_id = Some(project_id);
+            st.save(&tagged).unwrap();
+            st.save(&clip_at("unrelated other note", "text", 100)).unwrap();
+
+            let llm = Fixed(r#"{"version":1,"text":"notes","project":"CCM"}"#);
+            let hits = search_all_interpreted(&st, Some(&llm), "irrelevant raw text", 10).unwrap();
+            assert!(!hits.is_empty(), "a resolvable project name must not prevent results from reaching search_all");
+        }
+
+        #[test]
+        fn unresolvable_project_name_from_llm_degrades_without_failing_or_creating_a_project() {
+            let conn = store_conn();
+            let st = SqliteStore::new(&conn);
+            st.get_or_create_project("CCM").unwrap();
+            st.save(&clip_at("react hooks note", "text", 100)).unwrap();
+
+            let before: i64 = conn.query_row("SELECT count(*) FROM projects", [], |r| r.get(0)).unwrap();
+            let llm = Fixed(r#"{"version":1,"text":"react","project":"a project that does not exist"}"#);
+            let hits = search_all_interpreted(&st, Some(&llm), "irrelevant raw text", 10).unwrap();
+            let after: i64 = conn.query_row("SELECT count(*) FROM projects", [], |r| r.get(0)).unwrap();
+
+            assert_eq!(hits.len(), 1, "an unresolvable project name must degrade to no project filter, not zero results");
+            assert_eq!(before, after, "resolving an unknown project name through search_all_interpreted must never create a project");
+        }
     }
 }

@@ -2,14 +2,50 @@ mod autostart;
 mod clipboard_watcher;
 mod hotkey;
 
-use lumos_core::{db, search::SearchHit};
+use lumos_core::interpreter::SchemaInterpreter;
+use lumos_core::ollama::{OllamaConfig, OllamaInterpreter};
 use lumos_core::storage_sqlite::SqliteStore;
+use lumos_core::{db, interpreter, search::SearchHit};
 use rusqlite::Connection;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{Emitter, Manager};
 
 struct DbState(Arc<Mutex<Connection>>);
+
+/// Holds the configured Ollama client, if any — built once at startup from
+/// environment variables (there is no settings UI yet, per Phase 5.4's
+/// scope) and never health-checked at startup. `search_files` decides
+/// whether to use it fresh on every call; a down/misconfigured Ollama is
+/// discovered lazily, on the query that actually needs it, and falls back
+/// exactly like the CLI does.
+struct OllamaState(Option<OllamaInterpreter>);
+
+/// Reads `LUMOS_OLLAMA_*` env vars, matching the CLI's `--ollama-*` flags in
+/// spirit — this app has no CLI flags (it's a GUI process) and no settings
+/// file yet, so environment variables are the smallest addition consistent
+/// with how `LOCALAPPDATA` is already read elsewhere in this codebase
+/// (`db.rs`, `embeddings.rs`). `LUMOS_LLM=off` disables the interpreter
+/// outright, mirroring the CLI's `--no-llm`.
+fn ollama_config_from_env() -> Option<OllamaConfig> {
+    if std::env::var("LUMOS_LLM").as_deref() == Ok("off") {
+        return None;
+    }
+    let mut config = OllamaConfig::default();
+    if let Ok(url) = std::env::var("LUMOS_OLLAMA_URL") {
+        config.base_url = url;
+    }
+    if let Ok(model) = std::env::var("LUMOS_OLLAMA_MODEL") {
+        config.model = model;
+    }
+    if let Ok(ms) = std::env::var("LUMOS_OLLAMA_TIMEOUT_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            config.timeout = Duration::from_millis(ms);
+        }
+    }
+    Some(config)
+}
 
 /// Set while an external action (open file / reveal in explorer) is in
 /// flight, so the focus-lost handler doesn't hide the overlay the instant
@@ -17,9 +53,15 @@ struct DbState(Arc<Mutex<Connection>>);
 struct SuppressBlurHide(AtomicBool);
 
 #[tauri::command]
-fn search_files(state: tauri::State<DbState>, query: String) -> Result<Vec<SearchHit>, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    lumos_core::search::search_all_text(&SqliteStore::new(&conn), &query, 30).map_err(|e| e.to_string())
+fn search_files(
+    db: tauri::State<DbState>,
+    ollama: tauri::State<OllamaState>,
+    query: String,
+) -> Result<Vec<SearchHit>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let schema_interpreter = ollama.0.as_ref().map(|o| o as &dyn SchemaInterpreter);
+    interpreter::search_all_interpreted(&SqliteStore::new(&conn), schema_interpreter, &query, 30)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -296,6 +338,12 @@ pub fn run() {
             }
             app.manage(DbState(Arc::new(Mutex::new(conn))));
             app.manage(SuppressBlurHide(AtomicBool::new(false)));
+
+            // Built once, never pinged here — see `OllamaState`'s doc
+            // comment. `None` (LUMOS_LLM=off, or just never configured)
+            // means `search_files` always uses the deterministic parser,
+            // identically to before this feature existed.
+            app.manage(OllamaState(ollama_config_from_env().map(OllamaInterpreter::new)));
 
             // Semantic search backfill: catches up anything embedded
             // before this feature existed (or from a run where the model

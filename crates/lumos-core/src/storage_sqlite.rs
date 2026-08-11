@@ -437,6 +437,13 @@ impl ProjectStore for SqliteStore<'_> {
         Ok(self.conn.last_insert_rowid())
     }
 
+    fn find_project_by_name(&self, name: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_row("SELECT id FROM projects WHERE name = ?1", [name], |row| row.get(0))
+            .optional()
+            .context("looking up project by name")
+    }
+
     fn register_project_path(
         &self,
         project_id: i64,
@@ -1160,5 +1167,59 @@ mod tests {
 
         let ids = st.recent(ObjectType::File, 0, None, Some("jwt"), 10).unwrap();
         assert_eq!(ids, vec![file], "detected_type must be a no-op for File, not an error or an empty result");
+    }
+
+    // ---- Phase 5.4: ProjectStore::find_project_by_name (read-only) ----
+
+    #[test]
+    fn find_project_by_name_resolves_an_existing_project() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let id = st.get_or_create_project("CCM").unwrap();
+
+        assert_eq!(st.find_project_by_name("CCM").unwrap(), Some(id));
+    }
+
+    #[test]
+    fn find_project_by_name_returns_none_for_an_unknown_name() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        st.get_or_create_project("CCM").unwrap();
+
+        assert_eq!(st.find_project_by_name("does not exist").unwrap(), None);
+    }
+
+    #[test]
+    fn find_project_by_name_never_creates_a_project() {
+        // The entire reason this method exists rather than reusing
+        // `get_or_create_project`: an LLM-supplied name that doesn't match
+        // anything must not leave a new row behind. Assert on the actual
+        // row count, not just the return value, so a regression that
+        // silently starts inserting would be caught even if it also
+        // happened to return `None`.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        st.get_or_create_project("CCM").unwrap();
+
+        let before: i64 = conn.query_row("SELECT count(*) FROM projects", [], |r| r.get(0)).unwrap();
+        let result = st.find_project_by_name("a name nobody registered").unwrap();
+        let after: i64 = conn.query_row("SELECT count(*) FROM projects", [], |r| r.get(0)).unwrap();
+
+        assert_eq!(result, None);
+        assert_eq!(before, after, "find_project_by_name must never insert a row");
+    }
+
+    #[test]
+    fn find_project_by_name_is_exact_and_case_sensitive() {
+        // Documenting current behavior, not proposing fuzzy matching here —
+        // an LLM is expected to echo back the project name as it appeared
+        // in registered projects; silently fuzzy-matching would risk
+        // resolving to the wrong project.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        st.get_or_create_project("CCM").unwrap();
+
+        assert_eq!(st.find_project_by_name("ccm").unwrap(), None);
+        assert_eq!(st.find_project_by_name("CCM ").unwrap(), None);
     }
 }

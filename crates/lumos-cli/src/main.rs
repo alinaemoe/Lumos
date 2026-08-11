@@ -1,9 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use lumos_core::interpreter::SchemaInterpreter;
+use lumos_core::ollama::{OllamaConfig, OllamaInterpreter};
 use lumos_core::storage_sqlite::SqliteStore;
-use lumos_core::{clipboard, db, embeddings, metadata, scan, search, watcher};
+use lumos_core::{clipboard, db, embeddings, interpreter, metadata, scan, search, watcher};
 use rusqlite::Connection;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "lumos", about = "Lumos — personal computer memory system (core CLI)")]
@@ -11,6 +14,29 @@ struct Cli {
     /// Override the default database location (%LOCALAPPDATA%\Lumos\lumos.db)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+
+    /// Disable the Ollama-backed natural-language interpreter for
+    /// `search-all`, even if `--ollama-url`/the default is reachable. The
+    /// deterministic `type:`/`today`/`week` parser is always available
+    /// regardless of this flag — this only controls whether an LLM gets a
+    /// first attempt before falling back to it.
+    #[arg(long, global = true)]
+    no_llm: bool,
+
+    /// Ollama base URL. Only consulted if `--no-llm` is not set.
+    #[arg(long, global = true, default_value = "http://localhost:11434")]
+    ollama_url: String,
+
+    /// Ollama model name — kept configurable rather than hardcoded, since
+    /// which model is installed locally is a per-machine choice.
+    #[arg(long, global = true, default_value = "qwen3:4b")]
+    ollama_model: String,
+
+    /// Request timeout in milliseconds. A local Ollama that's slow to
+    /// respond or not running at all must not hang the CLI — this is the
+    /// bound that turns either case into a fallback instead of a hang.
+    #[arg(long, global = true, default_value = "15000")]
+    ollama_timeout_ms: u64,
 
     #[command(subcommand)]
     command: Command,
@@ -87,12 +113,27 @@ fn main() -> Result<()> {
     let db_path = cli.db.unwrap_or_else(db::default_db_path);
     let conn = db::open(&db_path)?;
 
+    // Built once per invocation, never probed — `search_all_interpreted`
+    // discovers whether Ollama is actually reachable lazily, on the one
+    // query this process makes, not at startup (§8 of
+    // `ARCHITECTURE_INVARIANTS.md`: graceful degradation, not
+    // probed-and-cached availability).
+    let ollama = if cli.no_llm {
+        None
+    } else {
+        Some(OllamaInterpreter::new(OllamaConfig {
+            base_url: cli.ollama_url,
+            model: cli.ollama_model,
+            timeout: Duration::from_millis(cli.ollama_timeout_ms),
+        }))
+    };
+
     match cli.command {
         Command::Project { action } => run_project(&conn, action)?,
         Command::Scan { path } => run_scan(&conn, &path)?,
         Command::Watch { paths } => run_watch(&conn, paths)?,
         Command::Search { query } => run_search(&conn, &query)?,
-        Command::SearchAll { query } => run_search_all(&conn, &query)?,
+        Command::SearchAll { query } => run_search_all(&conn, &query, ollama.as_ref())?,
         Command::Clipboard { action } => run_clipboard(&conn, action)?,
         Command::Embed => run_embed(&conn)?,
     }
@@ -168,8 +209,9 @@ fn run_search(conn: &Connection, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_search_all(conn: &Connection, query: &str) -> Result<()> {
-    let hits = search::search_all_text(&SqliteStore::new(conn), query, 20)?;
+fn run_search_all(conn: &Connection, query: &str, ollama: Option<&OllamaInterpreter>) -> Result<()> {
+    let schema_interpreter = ollama.map(|o| o as &dyn SchemaInterpreter);
+    let hits = interpreter::search_all_interpreted(&SqliteStore::new(conn), schema_interpreter, query, 20)?;
     if hits.is_empty() {
         println!("no matches for {query:?}");
         return Ok(());

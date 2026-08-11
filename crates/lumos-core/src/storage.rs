@@ -231,6 +231,20 @@ pub trait FullTextIndex {
 
 pub trait ProjectStore {
     fn get_or_create_project(&self, name: &str) -> Result<i64>;
+    /// Read-only lookup — the counterpart to [`ProjectStore::get_or_create_project`]
+    /// for callers that must never create a project as a side effect of
+    /// looking one up.
+    ///
+    /// Exists for Phase 5's LLM boundary specifically: an interpreter may
+    /// return a project *name* it heard in a query (§5.1 forbids it from
+    /// ever returning an id), and resolving that name against a
+    /// non-existent or misspelled project must degrade to "no project
+    /// filter", never silently create an empty project as a side effect of
+    /// a wrong guess. `get_or_create_project` is unsafe for that caller for
+    /// exactly this reason — it was written for `project add`, where
+    /// "create if missing" is the correct and intended behavior, not for
+    /// resolving untrusted free-text.
+    fn find_project_by_name(&self, name: &str) -> Result<Option<i64>>;
     fn register_project_path(
         &self,
         project_id: i64,
