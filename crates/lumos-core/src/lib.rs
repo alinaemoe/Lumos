@@ -2,6 +2,7 @@ pub mod clipboard;
 pub mod db;
 pub mod embeddings;
 pub mod indexer;
+pub mod intent_schema;
 pub mod metadata;
 pub mod models;
 pub mod object;
