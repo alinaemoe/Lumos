@@ -174,36 +174,17 @@ pub struct SearchIntent {
 /// [`SearchIntent`]'s contract. Never construct "everywhere" as an empty
 /// `object_types` vector; use this instead.
 ///
-/// The inner match is exhaustive on purpose: adding a new `ObjectType`
-/// variant without touching it fails to compile (a "non-exhaustive
-/// patterns" error), which is the "fail loudly on a new variant" behavior
-/// the Phase 5 brief asked for. Same idiom `storage_sqlite.rs` already
-/// uses for `type_tag`/`source_table`. It does not (and cannot, without a
-/// derive-macro dependency this crate doesn't have) automatically discover
-/// new variants — the array literal below still has to be kept in sync by
-/// hand — but it does guarantee no variant can be silently misclassified
-/// once it's in that list.
+/// Phase 6, Step 6.2: delegates to [`crate::registry::REGISTERED_OBJECT_TYPES`]
+/// — previously this function held its own hand-written copy of the list,
+/// independently of `storage_sqlite.rs`'s `SUPPORTED` constant, with
+/// nothing enforcing the two stayed in sync. `registry.rs` is now the one
+/// place either side reads. The compile-time "fail loudly on a new
+/// variant" exhaustive match this function used to do inline still exists
+/// — it moved to `registry.rs`'s own test, which is where it's now
+/// enforced (a plain `const` array can't be exhaustive by itself; see that
+/// module's doc comment).
 pub fn all_object_types() -> Vec<ObjectType> {
-    fn is_supported_by_generic_search(t: ObjectType) -> bool {
-        match t {
-            ObjectType::File | ObjectType::Clipboard => true,
-            ObjectType::Screenshot
-            | ObjectType::BrowserVisit
-            | ObjectType::Session
-            | ObjectType::Email => false,
-        }
-    }
-    [
-        ObjectType::File,
-        ObjectType::Clipboard,
-        ObjectType::Screenshot,
-        ObjectType::BrowserVisit,
-        ObjectType::Session,
-        ObjectType::Email,
-    ]
-    .into_iter()
-    .filter(|&t| is_supported_by_generic_search(t))
-    .collect()
+    crate::registry::REGISTERED_OBJECT_TYPES.to_vec()
 }
 
 /// Builds a [`SearchIntent`] from raw query text using the existing

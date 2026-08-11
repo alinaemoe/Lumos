@@ -10,6 +10,7 @@ pub mod object;
 pub mod object_adapters;
 pub mod ollama;
 pub mod pipeline;
+pub mod registry;
 pub mod scan;
 pub mod search;
 pub mod storage;

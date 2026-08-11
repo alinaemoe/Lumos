@@ -21,10 +21,6 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 
-/// Object types this store can persist. Everything else errors rather than
-/// returning empty — see `unsupported`.
-const SUPPORTED: &[ObjectType] = &[ObjectType::File, ObjectType::Clipboard];
-
 pub struct SqliteStore<'a> {
     conn: &'a Connection,
 }
@@ -78,7 +74,7 @@ fn unsupported(t: ObjectType) -> anyhow::Error {
     anyhow::anyhow!(
         "object type {:?} has no storage backing (supported: {:?})",
         t,
-        SUPPORTED
+        crate::registry::REGISTERED_OBJECT_TYPES
     )
 }
 
@@ -272,7 +268,7 @@ impl SqliteStore<'_> {
 
 impl ObjectStore for SqliteStore<'_> {
     fn supported_types(&self) -> &'static [ObjectType] {
-        SUPPORTED
+        crate::registry::REGISTERED_OBJECT_TYPES
     }
 
     /// The single point of per-source dispatch in the whole system.
