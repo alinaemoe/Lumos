@@ -344,30 +344,47 @@ impl ObjectStore for SqliteStore<'_> {
     /// `clipboard::search`'s pre-Phase-4 no-text branch always used, and
     /// this method exists specifically to preserve that behavior exactly,
     /// not to improve on it.
-    fn recent(&self, object_type: ObjectType, since: i64, until: Option<i64>, limit: usize) -> Result<Vec<ObjectId>> {
+    fn recent(
+        &self,
+        object_type: ObjectType,
+        since: i64,
+        until: Option<i64>,
+        detected_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ObjectId>> {
         let (table, order_by, since_column) = match object_type {
             ObjectType::File => ("files", "modified_at DESC", "modified_at"),
             ObjectType::Clipboard => ("clipboard_entries", "id DESC", "created_at"),
             t => return Err(unsupported(t)),
         };
-        // `until` is folded into the WHERE clause itself, before LIMIT —
-        // that ordering is the entire fix. Applying it after the fact (as
-        // a post-hydration filter on however many rows LIMIT happened to
-        // return) is what let newer rows crowd older in-window rows out of
-        // the result before the filter ever got a chance to run.
+        // `files` has no `detected_type` column and no such concept —
+        // silently ignored for it, same "no opinion" rule
+        // `matches_detected_type` already applies at the domain layer,
+        // rather than treating a meaningless constraint as an error.
+        let detected_type = detected_type.filter(|_| object_type == ObjectType::Clipboard);
+
+        // Both `until` and `detected_type` are folded into the WHERE
+        // clause itself, before LIMIT — that ordering is the entire fix,
+        // identical in shape to the earlier `until` fix and for the same
+        // reason: applying either only after LIMIT already ran is what
+        // let unrelated newer rows crowd the actual matches out of the
+        // result before the filter ever got a chance to run.
         // `table`/`order_by`/`since_column` are compile-time constants
         // from the match above — never caller-controlled — so building
-        // SQL with `format!` here carries no injection risk.
+        // SQL with `format!` here carries no injection risk. The
+        // detected_type *value* is always bound as a parameter, never
+        // interpolated into the SQL text.
         let mut sql = format!("SELECT id FROM {table} WHERE {since_column} >= ?1");
-        if until.is_some() {
-            sql.push_str(&format!(" AND {since_column} <= ?2"));
-        }
-        sql.push_str(&format!(" ORDER BY {order_by} LIMIT ?{}", if until.is_some() { 3 } else { 2 }));
-
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since)];
         if let Some(u) = until {
+            sql.push_str(&format!(" AND {since_column} <= ?{}", params.len() + 1));
             params.push(Box::new(u));
         }
+        if let Some(dt) = detected_type {
+            sql.push_str(&format!(" AND detected_type = ?{}", params.len() + 1));
+            params.push(Box::new(dt.to_string()));
+        }
+        sql.push_str(&format!(" ORDER BY {order_by} LIMIT ?{}", params.len() + 1));
         params.push(Box::new(limit as i64));
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
@@ -831,7 +848,7 @@ mod tests {
         let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
         let mid = st.save(&file_object_at("C:/p/mid.rs", 200)).unwrap();
 
-        let ids = st.recent(ObjectType::File, 0, None, 10).unwrap();
+        let ids = st.recent(ObjectType::File, 0, None, None, 10).unwrap();
         assert_eq!(ids, vec![new, mid, old], "most-recently-modified first");
     }
 
@@ -842,10 +859,10 @@ mod tests {
         st.save(&file_object_at("C:/p/old.rs", 100)).unwrap();
         let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
 
-        let ids = st.recent(ObjectType::File, 200, None, 10).unwrap();
+        let ids = st.recent(ObjectType::File, 200, None, None, 10).unwrap();
         assert_eq!(ids, vec![new], "rows before `since` must be excluded");
 
-        let capped = st.recent(ObjectType::File, 0, None, 1).unwrap();
+        let capped = st.recent(ObjectType::File, 0, None, None, 1).unwrap();
         assert_eq!(capped.len(), 1, "limit is honoured");
     }
 
@@ -859,7 +876,7 @@ mod tests {
         let first = st.save(&clip_object("first")).unwrap();
         let second = st.save(&clip_object("second")).unwrap();
 
-        let ids = st.recent(ObjectType::Clipboard, 0, None, 10).unwrap();
+        let ids = st.recent(ObjectType::Clipboard, 0, None, None, 10).unwrap();
         assert_eq!(ids, vec![second, first]);
     }
 
@@ -867,7 +884,7 @@ mod tests {
     fn recent_unsupported_type_errors() {
         let conn = store_conn();
         let st = SqliteStore::new(&conn);
-        assert!(st.recent(ObjectType::Screenshot, 0, None, 10).is_err());
+        assert!(st.recent(ObjectType::Screenshot, 0, None, None, 10).is_err());
     }
 
     // ---- Regression: recent()'s `until` must be enforced before LIMIT,
@@ -899,7 +916,7 @@ mod tests {
             .unwrap();
         }
 
-        let ids = st.recent(ObjectType::Clipboard, since, Some(until), 60).unwrap();
+        let ids = st.recent(ObjectType::Clipboard, since, Some(until), None, 60).unwrap();
         for id in &in_window {
             assert!(ids.contains(id), "in-window row {id:?} missing with only a few newer rows present");
         }
@@ -940,7 +957,7 @@ mod tests {
             .unwrap();
         }
 
-        let ids = st.recent(ObjectType::Clipboard, since, Some(until), 60).unwrap();
+        let ids = st.recent(ObjectType::Clipboard, since, Some(until), None, 60).unwrap();
         assert_eq!(
             ids.len(),
             3,
@@ -971,7 +988,7 @@ mod tests {
         )
         .unwrap();
 
-        let ids = st.recent(ObjectType::Clipboard, since, Some(until), 60).unwrap();
+        let ids = st.recent(ObjectType::Clipboard, since, Some(until), None, 60).unwrap();
         assert_eq!(ids, vec![in_window], "a row newer than `until` must not be returned");
     }
 
@@ -984,7 +1001,7 @@ mod tests {
         let old = st.save(&file_object_at("C:/p/old.rs", 100)).unwrap();
         let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
 
-        let ids = st.recent(ObjectType::File, 0, None, 10).unwrap();
+        let ids = st.recent(ObjectType::File, 0, None, None, 10).unwrap();
         assert_eq!(ids, vec![new, old], "since-only ordering/inclusion unchanged");
     }
 
@@ -1004,7 +1021,132 @@ mod tests {
                 .unwrap();
         }
 
-        let ids = st.recent(ObjectType::File, since, Some(until), 60).unwrap();
+        let ids = st.recent(ObjectType::File, since, Some(until), None, 60).unwrap();
         assert_eq!(ids, vec![in_window], "the one in-window file must survive 70 newer files");
+    }
+
+    // ---- Regression: recent()'s `detected_type` must be enforced before
+    // LIMIT, not after (the `type:jwt` bug: enough newer non-matching rows
+    // could exhaust the fetch budget before any matching row was ever
+    // fetched — reproduced live on real data). ----
+
+    #[test]
+    fn recent_with_detected_type_finds_matching_rows_when_few_unrelated_rows_exist() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+
+        let jwt_rows: Vec<ObjectId> = (0..3)
+            .map(|i| {
+                st.save(&NewObject::new(
+                    ObjectMetadata { created_at: Some(0), ..ObjectMetadata::default() },
+                    ObjectPayload::Clipboard(ClipboardPayload {
+                        text_content: format!("jwt token {i}"),
+                        detected_type: "jwt".into(),
+                        pinned: false,
+                        search_extra: None,
+                    }),
+                ))
+                .unwrap()
+            })
+            .collect();
+        for i in 0..5 {
+            st.save(&clip_object(&format!("unrelated {i}"))).unwrap();
+        }
+
+        let ids = st.recent(ObjectType::Clipboard, 0, None, Some("jwt"), 60).unwrap();
+        for id in &jwt_rows {
+            assert!(ids.contains(id), "jwt row {id:?} missing with only a few unrelated rows present");
+        }
+        assert_eq!(ids.len(), 3, "no non-jwt row must be included");
+    }
+
+    #[test]
+    fn recent_with_detected_type_finds_matching_rows_even_when_many_more_unrelated_rows_exist() {
+        // The actual reported bug, reproduced exactly: 3 real `jwt` rows,
+        // 70 unrelated newer rows, fetch_n=60. Pre-fix, `detected_type`
+        // was applied only after this call returned, so — with jwt rows
+        // inserted first, giving them the lowest ids, exactly as happens
+        // in real use — `ORDER BY id DESC LIMIT 60` picked the 70 newer
+        // unrelated rows and the 3 real jwt rows never entered the
+        // candidate set at all. This is precisely what was observed on
+        // the real live database: unrelated clipboard growth pushed the
+        // 60-most-recent-id cutoff past all three real `jwt` rows.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+
+        let jwt_rows: Vec<ObjectId> = (0..3)
+            .map(|i| {
+                st.save(&NewObject::new(
+                    ObjectMetadata { created_at: Some(0), ..ObjectMetadata::default() },
+                    ObjectPayload::Clipboard(ClipboardPayload {
+                        text_content: format!("jwt token {i}"),
+                        detected_type: "jwt".into(),
+                        pinned: false,
+                        search_extra: None,
+                    }),
+                ))
+                .unwrap()
+            })
+            .collect();
+        for i in 0..70 {
+            st.save(&clip_object(&format!("unrelated filler {i}"))).unwrap();
+        }
+
+        let ids = st.recent(ObjectType::Clipboard, 0, None, Some("jwt"), 60).unwrap();
+        assert_eq!(
+            ids.len(),
+            3,
+            "all 3 jwt rows must survive regardless of how many unrelated newer rows exist"
+        );
+        for id in &jwt_rows {
+            assert!(ids.contains(id), "jwt row {id:?} was crowded out by unrelated rows — the exact bug");
+        }
+    }
+
+    #[test]
+    fn recent_with_detected_type_excludes_non_matching_rows() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+
+        let jwt = st
+            .save(&NewObject::new(
+                ObjectMetadata { created_at: Some(0), ..ObjectMetadata::default() },
+                ObjectPayload::Clipboard(ClipboardPayload {
+                    text_content: "jwt token".into(),
+                    detected_type: "jwt".into(),
+                    pinned: false,
+                    search_extra: None,
+                }),
+            ))
+            .unwrap();
+        st.save(&clip_object("plain text, not jwt")).unwrap();
+
+        let ids = st.recent(ObjectType::Clipboard, 0, None, Some("jwt"), 60).unwrap();
+        assert_eq!(ids, vec![jwt], "a non-matching row must not be returned");
+    }
+
+    #[test]
+    fn recent_without_detected_type_behaves_exactly_as_before() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let first = st.save(&clip_object("first")).unwrap();
+        let second = st.save(&clip_object("second")).unwrap();
+
+        let ids = st.recent(ObjectType::Clipboard, 0, None, None, 10).unwrap();
+        assert_eq!(ids, vec![second, first], "no detected_type filter must be a no-op, identical to before this fix");
+    }
+
+    #[test]
+    fn recent_with_detected_type_is_ignored_for_file_rather_than_erroring() {
+        // Files have no detected_type column and no such concept. This
+        // must not error and must not silently return nothing — it must
+        // behave exactly as if `detected_type` were `None`, mirroring
+        // `matches_detected_type`'s "no opinion" rule at the domain layer.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let file = st.save(&file_object_at("C:/p/a.rs", 100)).unwrap();
+
+        let ids = st.recent(ObjectType::File, 0, None, Some("jwt"), 10).unwrap();
+        assert_eq!(ids, vec![file], "detected_type must be a no-op for File, not an error or an empty result");
     }
 }

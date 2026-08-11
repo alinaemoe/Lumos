@@ -345,21 +345,30 @@ where
             // defaults to "the beginning of time" so a `detected_type`- or
             // `until`-only intent still lists everything up to that point.
             //
-            // `until` is passed straight through to `recent()`, which
-            // enforces it in SQL before its own LIMIT — not left to
-            // `matches_time_bounds` after hydration. An earlier version
-            // filtered `until` post-hydration only, which meant enough
-            // objects newer than `until` could fill the entire fetch
-            // budget before any in-window object was ever retrieved
-            // (confirmed experimentally: 70 newer objects + fetch_n=60
-            // was enough to make 3 genuinely in-window objects vanish
-            // completely). `matches_time_bounds` still runs afterward as
-            // a defense-in-depth check — harmless here since `recent()`
-            // now only ever returns in-window rows, but still load-bearing
-            // for FTS/semantic candidates, which have no time filter at
-            // the retrieval layer at all.
+            // `until` and `detected_type` are both passed straight through
+            // to `recent()`, which enforces each in SQL before its own
+            // LIMIT — not left to `matches_time_bounds`/
+            // `matches_detected_type` after hydration. An earlier version
+            // filtered both post-hydration only, which meant enough
+            // unrelated rows newer than the actual matches could fill the
+            // entire fetch budget before any matching object was ever
+            // retrieved — confirmed experimentally for `until` (70 newer
+            // objects + fetch_n=60 made 3 in-window objects vanish) and
+            // separately confirmed for `detected_type` on the real live
+            // database (`type:jwt` returned nothing once unrelated
+            // clipboard growth pushed the 60-most-recent-id cutoff past
+            // all three real `jwt` rows). `matches_time_bounds`/
+            // `matches_detected_type` still run afterward as
+            // defense-in-depth — harmless here since `recent()` now only
+            // ever returns already-matching rows, but still load-bearing
+            // for FTS/semantic candidates, which have no time or
+            // detected_type filter at the retrieval layer at all.
             let since = intent.since.unwrap_or(i64::MIN);
-            for (rank, object_id) in store.recent(object_type, since, intent.until, fetch_n)?.into_iter().enumerate() {
+            for (rank, object_id) in store
+                .recent(object_type, since, intent.until, intent.detected_type.as_deref(), fetch_n)?
+                .into_iter()
+                .enumerate()
+            {
                 candidates.push(Candidate {
                     object_id,
                     source: RetrievalSource::Recency,
@@ -649,9 +658,11 @@ where
             .map(|(local_id, _score)| ObjectId::new(ObjectType::File, local_id))
             .collect()
     } else if let Some(since) = since {
-        // This function's own contract has no `until` — pass `None` to
-        // preserve its exact pre-fix behavior (a plain lower-bound listing).
-        store.recent(ObjectType::File, since, None, limit)?
+        // This function's own contract has no `until`/`detected_type` —
+        // pass `None` for both to preserve its exact pre-fix behavior (a
+        // plain lower-bound listing). It's File-only anyway, and
+        // `detected_type` has no meaning for File.
+        store.recent(ObjectType::File, since, None, None, limit)?
     } else {
         Vec::new()
     };
@@ -1153,6 +1164,39 @@ mod tests {
         assert!(
             returned.is_disjoint(&today_ids),
             "no today entry must leak into a yesterday result — got {returned:?}"
+        );
+    }
+
+    #[test]
+    fn search_all_type_jwt_survives_being_crowded_by_many_unrelated_entries() {
+        // End-to-end regression for the exact live-database failure:
+        // `search-all type:jwt` returned nothing once unrelated clipboard
+        // growth pushed the 60-most-recent-id cutoff past all 3 real jwt
+        // rows. Same shape as the `until` crowding test above, for
+        // `detected_type` instead of a time bound.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+
+        let jwt_ids: std::collections::HashSet<i64> = (0..3)
+            .map(|i| st.save(&clip_at(&format!("jwt token {i}"), "jwt", 100)).unwrap().local_id)
+            .collect();
+        let unrelated_ids: std::collections::HashSet<i64> = (0..70)
+            .map(|i| st.save(&clip_at(&format!("unrelated filler {i}"), "text", 200)).unwrap().local_id)
+            .collect();
+
+        let hits = search_all_text(&st, "type:jwt", 20).unwrap();
+        let returned: std::collections::HashSet<i64> = hits
+            .iter()
+            .map(|h| match h {
+                SearchHit::Clipboard(c) => c.id,
+                SearchHit::File(f) => f.id,
+            })
+            .collect();
+
+        assert_eq!(returned, jwt_ids, "all 3 jwt entries must survive 70 crowding unrelated entries");
+        assert!(
+            returned.is_disjoint(&unrelated_ids),
+            "no unrelated entry must leak into a type:jwt result — got {returned:?}"
         );
     }
 

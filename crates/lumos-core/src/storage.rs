@@ -152,7 +152,28 @@ pub trait ObjectStore {
     /// `until` only after this call's result was hydrated, so enough
     /// objects newer than `until` could exhaust `limit` before any object
     /// actually inside the window was ever fetched.)
-    fn recent(&self, object_type: ObjectType, since: i64, until: Option<i64>, limit: usize) -> Result<Vec<ObjectId>>;
+    ///
+    /// `detected_type`, when present, must be enforced the same way —
+    /// before `limit`, not after. This was the identical bug in a second
+    /// place: `type:jwt` with no other text means "list recent objects
+    /// with `detected_type == "jwt"`," and if that constraint is only
+    /// checked after this call returns, enough non-`jwt` rows newer than
+    /// the actual `jwt` rows can fill `limit` before any `jwt` row is ever
+    /// fetched — reproduced on the real live database (60-most-recent-id
+    /// cutoff had moved past all three real `jwt` rows purely from
+    /// unrelated clipboard growth). `detected_type` has no meaning for
+    /// types that don't carry it (`File`) — implementations must ignore
+    /// it for those, the same "no opinion, not an error" rule
+    /// `matches_detected_type` already applies at the domain layer, not
+    /// treat it as a reason to fail or to silently return nothing.
+    fn recent(
+        &self,
+        object_type: ObjectType,
+        since: i64,
+        until: Option<i64>,
+        detected_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ObjectId>>;
 
     /// Loads full objects by identity — the hydration step Search needs to
     /// turn an `EmbeddingStore::nearest`/`FullTextIndex::search_text` hit
