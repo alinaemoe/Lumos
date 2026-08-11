@@ -344,18 +344,35 @@ impl ObjectStore for SqliteStore<'_> {
     /// `clipboard::search`'s pre-Phase-4 no-text branch always used, and
     /// this method exists specifically to preserve that behavior exactly,
     /// not to improve on it.
-    fn recent(&self, object_type: ObjectType, since: i64, limit: usize) -> Result<Vec<ObjectId>> {
+    fn recent(&self, object_type: ObjectType, since: i64, until: Option<i64>, limit: usize) -> Result<Vec<ObjectId>> {
         let (table, order_by, since_column) = match object_type {
             ObjectType::File => ("files", "modified_at DESC", "modified_at"),
             ObjectType::Clipboard => ("clipboard_entries", "id DESC", "created_at"),
             t => return Err(unsupported(t)),
         };
-        // All three are compile-time constants from the match above.
-        let sql = format!(
-            "SELECT id FROM {table} WHERE {since_column} >= ?1 ORDER BY {order_by} LIMIT ?2"
-        );
+        // `until` is folded into the WHERE clause itself, before LIMIT —
+        // that ordering is the entire fix. Applying it after the fact (as
+        // a post-hydration filter on however many rows LIMIT happened to
+        // return) is what let newer rows crowd older in-window rows out of
+        // the result before the filter ever got a chance to run.
+        // `table`/`order_by`/`since_column` are compile-time constants
+        // from the match above — never caller-controlled — so building
+        // SQL with `format!` here carries no injection risk.
+        let mut sql = format!("SELECT id FROM {table} WHERE {since_column} >= ?1");
+        if until.is_some() {
+            sql.push_str(&format!(" AND {since_column} <= ?2"));
+        }
+        sql.push_str(&format!(" ORDER BY {order_by} LIMIT ?{}", if until.is_some() { 3 } else { 2 }));
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since)];
+        if let Some(u) = until {
+            params.push(Box::new(u));
+        }
+        params.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![since, limit as i64], |row| {
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(ObjectId::new(object_type, row.get::<_, i64>(0)?))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -814,7 +831,7 @@ mod tests {
         let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
         let mid = st.save(&file_object_at("C:/p/mid.rs", 200)).unwrap();
 
-        let ids = st.recent(ObjectType::File, 0, 10).unwrap();
+        let ids = st.recent(ObjectType::File, 0, None, 10).unwrap();
         assert_eq!(ids, vec![new, mid, old], "most-recently-modified first");
     }
 
@@ -825,10 +842,10 @@ mod tests {
         st.save(&file_object_at("C:/p/old.rs", 100)).unwrap();
         let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
 
-        let ids = st.recent(ObjectType::File, 200, 10).unwrap();
+        let ids = st.recent(ObjectType::File, 200, None, 10).unwrap();
         assert_eq!(ids, vec![new], "rows before `since` must be excluded");
 
-        let capped = st.recent(ObjectType::File, 0, 1).unwrap();
+        let capped = st.recent(ObjectType::File, 0, None, 1).unwrap();
         assert_eq!(capped.len(), 1, "limit is honoured");
     }
 
@@ -842,7 +859,7 @@ mod tests {
         let first = st.save(&clip_object("first")).unwrap();
         let second = st.save(&clip_object("second")).unwrap();
 
-        let ids = st.recent(ObjectType::Clipboard, 0, 10).unwrap();
+        let ids = st.recent(ObjectType::Clipboard, 0, None, 10).unwrap();
         assert_eq!(ids, vec![second, first]);
     }
 
@@ -850,6 +867,144 @@ mod tests {
     fn recent_unsupported_type_errors() {
         let conn = store_conn();
         let st = SqliteStore::new(&conn);
-        assert!(st.recent(ObjectType::Screenshot, 0, 10).is_err());
+        assert!(st.recent(ObjectType::Screenshot, 0, None, 10).is_err());
+    }
+
+    // ---- Regression: recent()'s `until` must be enforced before LIMIT,
+    // not after (the bug: enough newer rows could exhaust the fetch budget
+    // before any in-window row was ever retrieved). ----
+
+    #[test]
+    fn recent_with_until_finds_in_window_clipboard_rows_when_few_newer_rows_exist() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let since = 1_000;
+        let until = 2_000;
+
+        let in_window: Vec<ObjectId> = (0..3)
+            .map(|i| st.save(&clip_object(&format!("yesterday {i}"))).unwrap())
+            .collect();
+        // A handful of newer rows — not enough to challenge a naive fix,
+        // this is the easy case named explicitly in the requirements.
+        for i in 0..5 {
+            st.save(&clip_object(&format!("today {i}"))).unwrap();
+        }
+        // Backdate the "in_window" rows into [since, until]; leave the
+        // "today" rows at their real (newer) insertion-time created_at.
+        for id in &in_window {
+            conn.execute(
+                "UPDATE clipboard_entries SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![since + 100, id.local_id],
+            )
+            .unwrap();
+        }
+
+        let ids = st.recent(ObjectType::Clipboard, since, Some(until), 60).unwrap();
+        for id in &in_window {
+            assert!(ids.contains(id), "in-window row {id:?} missing with only a few newer rows present");
+        }
+    }
+
+    #[test]
+    fn recent_with_until_finds_in_window_clipboard_rows_even_when_many_more_newer_rows_exist() {
+        // The actual bug reproduction: 70 "today" rows, 3 "yesterday" rows,
+        // fetch_n = 60. Pre-fix, `until` was applied only after this call
+        // returned, so the 70 newer rows (inserted with higher ids, so
+        // `ORDER BY id DESC LIMIT 60` picked them first) filled the entire
+        // budget and all 3 in-window rows vanished with zero returned.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let since = 1_000_000;
+        let until = 2_000_000;
+
+        // In-window rows inserted FIRST so they get the lowest ids — the
+        // realistic case, since older events are always inserted earlier
+        // than newer ones. This is exactly what defeated the pre-fix
+        // `ORDER BY id DESC LIMIT` when `until` wasn't in the WHERE clause.
+        let in_window: Vec<ObjectId> = (0..3)
+            .map(|i| st.save(&clip_object(&format!("yesterday joke {i}"))).unwrap())
+            .collect();
+        for id in &in_window {
+            conn.execute(
+                "UPDATE clipboard_entries SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![since + 100, id.local_id],
+            )
+            .unwrap();
+        }
+        for i in 0..70 {
+            let id = st.save(&clip_object(&format!("today filler {i}"))).unwrap();
+            conn.execute(
+                "UPDATE clipboard_entries SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![until + 10_000 + i, id.local_id],
+            )
+            .unwrap();
+        }
+
+        let ids = st.recent(ObjectType::Clipboard, since, Some(until), 60).unwrap();
+        assert_eq!(
+            ids.len(),
+            3,
+            "all 3 in-window rows must survive regardless of how many newer rows exist"
+        );
+        for id in &in_window {
+            assert!(ids.contains(id), "in-window row {id:?} was crowded out by newer rows — the exact bug");
+        }
+    }
+
+    #[test]
+    fn recent_with_until_excludes_rows_newer_than_until() {
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let since = 1_000;
+        let until = 2_000;
+
+        let in_window = st.save(&clip_object("in window")).unwrap();
+        conn.execute(
+            "UPDATE clipboard_entries SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![since + 50, in_window.local_id],
+        )
+        .unwrap();
+        let too_new = st.save(&clip_object("too new")).unwrap();
+        conn.execute(
+            "UPDATE clipboard_entries SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![until + 50, too_new.local_id],
+        )
+        .unwrap();
+
+        let ids = st.recent(ObjectType::Clipboard, since, Some(until), 60).unwrap();
+        assert_eq!(ids, vec![in_window], "a row newer than `until` must not be returned");
+    }
+
+    #[test]
+    fn recent_without_until_behaves_exactly_as_before() {
+        // `today`/`week`-style calls (`until: None`) must be completely
+        // unaffected by this fix.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let old = st.save(&file_object_at("C:/p/old.rs", 100)).unwrap();
+        let new = st.save(&file_object_at("C:/p/new.rs", 300)).unwrap();
+
+        let ids = st.recent(ObjectType::File, 0, None, 10).unwrap();
+        assert_eq!(ids, vec![new, old], "since-only ordering/inclusion unchanged");
+    }
+
+    #[test]
+    fn recent_with_until_works_for_file_type_too() {
+        // Point 5 of the requirements: both supported object types, not
+        // just Clipboard.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let since = 1_000_000;
+        let until = 2_000_000;
+
+        let in_window = st.save(&file_object_at("C:/p/yesterday.rs", since + 500)).unwrap();
+        // Many newer files, same crowding shape as the clipboard case.
+        for i in 0..70 {
+            st.save(&file_object_at(&format!("C:/p/today_{i}.rs"), until + 10_000 + i))
+                .unwrap();
+        }
+
+        let ids = st.recent(ObjectType::File, since, Some(until), 60).unwrap();
+        assert_eq!(ids, vec![in_window], "the one in-window file must survive 70 newer files");
     }
 }

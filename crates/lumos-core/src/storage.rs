@@ -141,7 +141,18 @@ pub trait ObjectStore {
     /// `modified_at` vs. a clipboard entry's insertion order) — the domain
     /// only asks for "recent objects of this type since this time," not
     /// which column that maps to.
-    fn recent(&self, object_type: ObjectType, since: i64, limit: usize) -> Result<Vec<ObjectId>>;
+    /// `until`, when present, is enforced by the implementation *before*
+    /// `limit` is applied — not as a post-hydration filter. Objects outside
+    /// `[since, until]` must never be able to consume the candidate budget
+    /// that objects inside the window need: with `until: None` this method
+    /// answers "the `limit` most recent objects since `since`," but with
+    /// `until: Some(u)` it must answer "up to `limit` objects in
+    /// `[since, u]`," and those are different queries, not the same query
+    /// filtered afterward. (This was a real bug: an early version applied
+    /// `until` only after this call's result was hydrated, so enough
+    /// objects newer than `until` could exhaust `limit` before any object
+    /// actually inside the window was ever fetched.)
+    fn recent(&self, object_type: ObjectType, since: i64, until: Option<i64>, limit: usize) -> Result<Vec<ObjectId>>;
 
     /// Loads full objects by identity — the hydration step Search needs to
     /// turn an `EmbeddingStore::nearest`/`FullTextIndex::search_text` hit

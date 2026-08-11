@@ -343,13 +343,23 @@ where
             // `type:jwt` returning zero results, caught by the CLI smoke
             // test rather than left as a silent regression. `since`
             // defaults to "the beginning of time" so a `detected_type`- or
-            // `until`-only intent still lists everything up to that point;
-            // `matches_time_bounds`/`matches_detected_type` after
-            // hydration narrow it down further (`ObjectStore::recent` only
-            // takes a lower bound — `until` is applied post-hydration like
-            // `since` already was).
+            // `until`-only intent still lists everything up to that point.
+            //
+            // `until` is passed straight through to `recent()`, which
+            // enforces it in SQL before its own LIMIT — not left to
+            // `matches_time_bounds` after hydration. An earlier version
+            // filtered `until` post-hydration only, which meant enough
+            // objects newer than `until` could fill the entire fetch
+            // budget before any in-window object was ever retrieved
+            // (confirmed experimentally: 70 newer objects + fetch_n=60
+            // was enough to make 3 genuinely in-window objects vanish
+            // completely). `matches_time_bounds` still runs afterward as
+            // a defense-in-depth check — harmless here since `recent()`
+            // now only ever returns in-window rows, but still load-bearing
+            // for FTS/semantic candidates, which have no time filter at
+            // the retrieval layer at all.
             let since = intent.since.unwrap_or(i64::MIN);
-            for (rank, object_id) in store.recent(object_type, since, fetch_n)?.into_iter().enumerate() {
+            for (rank, object_id) in store.recent(object_type, since, intent.until, fetch_n)?.into_iter().enumerate() {
                 candidates.push(Candidate {
                     object_id,
                     source: RetrievalSource::Recency,
@@ -625,7 +635,9 @@ where
             .map(|(local_id, _score)| ObjectId::new(ObjectType::File, local_id))
             .collect()
     } else if let Some(since) = since {
-        store.recent(ObjectType::File, since, limit)?
+        // This function's own contract has no `until` — pass `None` to
+        // preserve its exact pre-fix behavior (a plain lower-bound listing).
+        store.recent(ObjectType::File, since, None, limit)?
     } else {
         Vec::new()
     };
@@ -1086,6 +1098,66 @@ mod tests {
         match &hits[0] {
             SearchHit::File(f) => assert_eq!(f.id, in_window.local_id),
             _ => panic!("expected file"),
+        }
+    }
+
+    #[test]
+    fn search_all_yesterday_survives_being_crowded_by_many_today_objects() {
+        // End-to-end regression for the exact bug reported and
+        // experimentally reproduced: 70 "today" clipboard entries + 3
+        // "yesterday" entries, `limit=20` (-> fetch_n=60 via
+        // CANDIDATE_OVERFETCH). Pre-fix this returned 0 of the 3.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let now = crate::now_secs();
+
+        let yesterday_ids: std::collections::HashSet<i64> = (0..3)
+            .map(|i| {
+                st.save(&clip_at(&format!("yesterday joke {i}"), "text", now - 30 * 3600))
+                    .unwrap()
+                    .local_id
+            })
+            .collect();
+        let today_ids: std::collections::HashSet<i64> = (0..70)
+            .map(|i| {
+                st.save(&clip_at(&format!("today filler {i}"), "text", now - 3600))
+                    .unwrap()
+                    .local_id
+            })
+            .collect();
+
+        let hits = search_all_text(&st, "yesterday", 20).unwrap();
+        let returned: std::collections::HashSet<i64> = hits
+            .iter()
+            .map(|h| match h {
+                SearchHit::Clipboard(c) => c.id,
+                SearchHit::File(f) => f.id,
+            })
+            .collect();
+
+        assert_eq!(returned, yesterday_ids, "all 3 yesterday entries must survive 70 crowding today entries");
+        assert!(
+            returned.is_disjoint(&today_ids),
+            "no today entry must leak into a yesterday result — got {returned:?}"
+        );
+    }
+
+    #[test]
+    fn search_all_today_unaffected_by_the_until_fix() {
+        // Requirement: `today` behavior (since-only, `until: None`) must
+        // be byte-for-byte unchanged by this fix.
+        let conn = store_conn();
+        let st = SqliteStore::new(&conn);
+        let now = crate::now_secs();
+
+        let today = st.save(&clip_at("today entry", "text", now - 3600)).unwrap();
+        st.save(&clip_at("old entry", "text", now - 3 * 86_400)).unwrap();
+
+        let hits = search_all_text(&st, "today", 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            SearchHit::Clipboard(c) => assert_eq!(c.id, today.local_id),
+            _ => panic!("expected clipboard"),
         }
     }
 
