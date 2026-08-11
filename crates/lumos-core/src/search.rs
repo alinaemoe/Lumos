@@ -150,7 +150,7 @@ pub fn parse_filters(raw: &str) -> (String, Filters) {
 ///    source-specific attribute would turn this struct into exactly the
 ///    "one field per source" pattern the generic engine exists to avoid;
 ///    the boundary is enforced here, in the contract, not in the engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchIntent {
     pub text: String,
     pub object_types: Vec<ObjectType>,
