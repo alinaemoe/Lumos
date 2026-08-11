@@ -23,5 +23,5 @@ ort = "2.0.0-rc.13"
 # in the same binary.
 tokenizers = { version = "0.20", default-features = false, features = ["onig", "progressbar"] }
 ndarray = "0.17"
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
 log = "0.4"

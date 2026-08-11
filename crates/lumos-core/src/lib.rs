@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod models;
 pub mod object;
 pub mod object_adapters;
+pub mod ollama;
 pub mod pipeline;
 pub mod scan;
 pub mod search;
