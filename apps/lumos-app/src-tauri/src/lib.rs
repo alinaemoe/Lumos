@@ -402,9 +402,19 @@ mod tests {
     // each test clears every `LUMOS_*` var it touches — including ones it
     // didn't set — is to stay correct if a sibling test is ever added
     // rather than relying on there being only one test file forever.
+    //
+    // The env vars themselves are process-global state, and Rust's default
+    // test harness runs tests in separate threads of the same process — so
+    // without serialization, these three tests race on the same
+    // `LUMOS_LLM`/`LUMOS_OLLAMA_*` variables and intermittently observe
+    // each other's in-flight state. `ENV_TEST_LOCK` makes "one of these
+    // three env-var tests running" mutually exclusive, without touching
+    // the harness's parallelism for anything else in the workspace.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn llm_off_disables_the_interpreter_entirely() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::set_var("LUMOS_LLM", "off");
         let config = ollama_config_from_env();
         std::env::remove_var("LUMOS_LLM");
@@ -421,6 +431,7 @@ mod tests {
 
     #[test]
     fn default_env_produces_a_config_with_the_documented_defaults() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var("LUMOS_LLM");
         std::env::remove_var("LUMOS_OLLAMA_URL");
         std::env::remove_var("LUMOS_OLLAMA_MODEL");
@@ -433,6 +444,7 @@ mod tests {
 
     #[test]
     fn env_vars_override_the_defaults() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var("LUMOS_LLM");
         std::env::set_var("LUMOS_OLLAMA_URL", "http://localhost:9999");
         std::env::set_var("LUMOS_OLLAMA_MODEL", "custom-model");
