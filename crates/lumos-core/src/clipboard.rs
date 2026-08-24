@@ -1,7 +1,8 @@
-use crate::object::{ClipboardPayload, ObjectMetadata, ObjectPayload, ObjectType};
+use crate::object::{ClipboardPayload, ObjectId, ObjectMetadata, ObjectPayload, ObjectType};
 use crate::pipeline::{ingest, Ingestable};
 use crate::search::sanitize_fts_query;
 use crate::storage::{EmbeddingStore, NewObject, ObjectStore};
+use crate::storage_sqlite::SqliteStore;
 use anyhow::{Context, Result};
 use regex::Regex;
 use rusqlite::Connection;
@@ -453,22 +454,50 @@ pub fn set_pinned(conn: &Connection, id: i64, pinned: bool) -> Result<()> {
 /// Deletes text clipboard entries older than `days`, skipping anything
 /// pinned — retention is a privacy/bloat control, not a reason to lose
 /// something the user deliberately kept. Returns the number of rows removed.
+///
+/// Phase 7 (V10 / §10.2): routed through `ObjectStore::delete` — which
+/// already removes an object's derived data (its embedding) as part of
+/// deleting the object itself — rather than deleting rows with raw SQL and
+/// running a separate orphan-embedding sweep afterward. That was a second,
+/// independent deletion path that could enforce §10.2 correctly only by
+/// remembering to; this can't skip the cleanup, because there is no way to
+/// call `delete` without it.
+///
+/// Not naively N single-row transactions, either: clipboard entries are
+/// rate-limited by how fast a human can copy things (realistically tens to
+/// low hundreds a day, purged incrementally on every app launch — not the
+/// bulk-import scale `pipeline.rs` flags batching as unsolved for). The
+/// whole sweep still runs inside one transaction via
+/// `unchecked_transaction` (this function only ever receives `&Connection`,
+/// never `&mut Connection`, so `Connection::transaction` isn't callable
+/// here — this is the shared-connection escape hatch rusqlite provides for
+/// exactly that shape), so a purge of any realistic size still costs one
+/// commit, not one per row.
 pub fn purge_older_than(conn: &Connection, days: i64) -> Result<usize> {
     let cutoff = now() - days * 86_400;
-    let removed = conn
-        .execute(
-            "DELETE FROM clipboard_entries WHERE created_at < ?1 AND pinned = 0",
-            [cutoff],
-        )
-        .context("purging old clipboard entries")?;
-    // No FK between embeddings and clipboard_entries (it's a generic
-    // object_type/object_id table shared with files), so orphans need an
-    // explicit sweep rather than an ON DELETE CASCADE.
-    conn.execute(
-        "DELETE FROM embeddings WHERE object_type = 'clipboard' AND object_id NOT IN (SELECT id FROM clipboard_entries)",
-        [],
-    )
-    .context("cleaning orphaned clipboard embeddings")?;
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM clipboard_entries WHERE created_at < ?1 AND pinned = 0",
+        )?;
+        let rows = stmt.query_map([cutoff], |r| r.get::<_, i64>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("listing clipboard entries eligible for retention purge")?
+    };
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .context("starting retention purge transaction")?;
+    let store = SqliteStore::new(conn);
+    let mut removed = 0usize;
+    for id in ids {
+        if store.delete(ObjectId::new(ObjectType::Clipboard, id))? {
+            removed += 1;
+        }
+    }
+    tx.commit().context("committing retention purge")?;
     Ok(removed)
 }
 
@@ -525,5 +554,103 @@ mod pipeline_tests {
             )
             .unwrap();
         assert_eq!(n, 1, "JWT classification and search_extra must survive the shared pipeline");
+    }
+
+    // ---- Phase 7, Step 7.3: purge_older_than routed through ObjectStore::delete ----
+
+    fn clip_at(text: &str, created_at: i64, pinned: bool) -> NewObject {
+        NewObject::new(
+            ObjectMetadata { created_at: Some(created_at), updated_at: None, project_id: None, source: None },
+            ObjectPayload::Clipboard(ClipboardPayload {
+                text_content: text.into(),
+                detected_type: "text".into(),
+                pinned,
+                search_extra: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn purge_older_than_removes_unpinned_entries_past_the_cutoff() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let store = SqliteStore::new(&conn);
+        let now_ts = now();
+        let old = store.save(&clip_at("old note", now_ts - 200 * 86_400, false)).unwrap();
+        let recent = store.save(&clip_at("recent note", now_ts - 10 * 86_400, false)).unwrap();
+
+        let removed = purge_older_than(&conn, 90).unwrap();
+
+        assert_eq!(removed, 1);
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT id FROM clipboard_entries")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![recent.local_id]);
+        assert!(!remaining.contains(&old.local_id));
+    }
+
+    #[test]
+    fn purge_older_than_never_removes_pinned_entries() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let store = SqliteStore::new(&conn);
+        let now_ts = now();
+        let pinned = store.save(&clip_at("pinned old note", now_ts - 200 * 86_400, true)).unwrap();
+
+        let removed = purge_older_than(&conn, 90).unwrap();
+
+        assert_eq!(removed, 0, "a pinned entry must survive retention regardless of age");
+        let still_there: i64 = conn
+            .query_row("SELECT count(*) FROM clipboard_entries WHERE id = ?1", [pinned.local_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still_there, 1);
+    }
+
+    #[test]
+    fn purge_older_than_also_removes_the_purged_entrys_embedding() {
+        // The actual §10.2 regression this step fixes: the old raw-SQL
+        // delete + separate orphan sweep could enforce this correctly, but
+        // nothing made it impossible to get wrong. Routing through
+        // `ObjectStore::delete` makes it structurally impossible to purge a
+        // row and leave its embedding behind.
+        let conn = crate::db::open_in_memory().unwrap();
+        let store = SqliteStore::new(&conn);
+        let now_ts = now();
+        let old = store.save(&clip_at("old note with a vector", now_ts - 200 * 86_400, false)).unwrap();
+        store.put_vector(old, &[0.1, 0.2, 0.3]).unwrap();
+        assert_eq!(store.vector_count(ObjectType::Clipboard).unwrap(), 1, "test setup: embedding must exist before the purge");
+
+        let removed = purge_older_than(&conn, 90).unwrap();
+
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store.vector_count(ObjectType::Clipboard).unwrap(),
+            0,
+            "the purged entry's embedding must be gone too, not orphaned"
+        );
+    }
+
+    #[test]
+    fn purge_older_than_handles_a_batch_larger_than_one_correctly() {
+        // Doesn't observe the transaction itself (not visible from outside
+        // the connection without instrumenting SQLite) — this only proves
+        // the batched-delete loop's *result* is still correct at a size
+        // where an off-by-one or a partial-failure-mid-loop bug would have
+        // somewhere to hide, unlike the single-row tests above.
+        let conn = crate::db::open_in_memory().unwrap();
+        let store = SqliteStore::new(&conn);
+        let now_ts = now();
+        for i in 0..50 {
+            store.save(&clip_at(&format!("old note {i}"), now_ts - 200 * 86_400, false)).unwrap();
+        }
+        store.save(&clip_at("recent note", now_ts - 10 * 86_400, false)).unwrap();
+
+        let removed = purge_older_than(&conn, 90).unwrap();
+
+        assert_eq!(removed, 50);
+        let remaining: i64 = conn.query_row("SELECT count(*) FROM clipboard_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining, 1);
     }
 }
