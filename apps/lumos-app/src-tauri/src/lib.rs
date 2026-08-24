@@ -1,6 +1,7 @@
 mod autostart;
 mod clipboard_watcher;
 mod hotkey;
+mod win32;
 
 use lumos_core::interpreter::SchemaInterpreter;
 use lumos_core::ollama::{OllamaConfig, OllamaInterpreter};
@@ -90,34 +91,11 @@ fn hide_overlay(app: tauri::AppHandle) {
 /// picker for 10 seconds".
 const PICKER_PROCESS_NAMES: &[&str] = &["openwith.exe", "applicationframehost.exe"];
 
+/// Lowercased exe file name of the foreground process — used to match
+/// against `PICKER_PROCESS_NAMES`. The actual Win32 lookup is shared with
+/// `clipboard_watcher.rs`'s `foreground_app_name` — see `win32.rs`.
 fn foreground_process_name() -> Option<String> {
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
-
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return None;
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 260];
-        let mut len = buf.len() as u32;
-        let result = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            windows::core::PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        );
-        let _ = windows::Win32::Foundation::CloseHandle(handle);
-        result.ok()?;
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        path.rsplit(['\\', '/']).next().map(|s| s.to_lowercase())
-    }
+    win32::foreground_exe_name().map(|s| s.to_lowercase())
 }
 
 /// Runs an external action (open/reveal) that spawns another top-level
