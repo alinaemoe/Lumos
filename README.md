@@ -9,6 +9,14 @@ Everything runs locally; there is no cloud, and the system works fully **without
 > You don't remember the file name. You remember "that Azure certificate error from March" and the
 > command you copied from Stack Overflow. Lumos is built for that.
 
+<p align="center"><img src="docs/screenshots/search.gif" alt="Lumos overlay: typing 'azure certificate' finds files and clipboard items together" width="80%"></p>
+
+<p align="center"><sub>The real overlay UI, rendered with sample data (the Tauri backend call is mocked for the screenshot). Files and clipboard entries come back in one list; <code>type:jwt</code>, <code>today</code> and <code>week</code> filters work without any LLM.</sub></p>
+
+| Filter by what you copied | Autocomplete for filters |
+|---|---|
+| ![type:jwt filter](docs/screenshots/filter-type.png) | ![Suggestions after typing type:](docs/screenshots/suggestions.png) |
+
 ## What works today
 
 - **Files.** Directory scan and live file watching, content and path indexed in SQLite FTS5, folders
